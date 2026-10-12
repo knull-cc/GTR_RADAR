@@ -6,7 +6,8 @@ taken from the *train* dataset scaler. zero_mode='scaled' uses 0 in scaled space
 import numpy as np
 import torch
 
-TEST_CONDITIONS = ('clean', 'T1_raw', 'T1_scaled', 'T2_k4', 'T2_k8', 'T3_flat')
+ALL_CONDITIONS = ('clean', 'T1_raw', 'T1_scaled', 'T2_k4', 'T2_k8', 'T3_flat')  # all implemented conditions
+TEST_CONDITIONS = ('clean', 'T1_raw', 'T2_k4')  # main protocol (clean / last point zeroed / last 4 zeroed)
 
 
 def raw_zero_from_scaler(scaler, zero_mode='raw'):

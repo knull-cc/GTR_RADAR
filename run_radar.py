@@ -7,7 +7,7 @@ commands:
   train_aug       S1  fine-tune backbone with the RADAR augmentation mixture (fair control)  -> aug.pth
   pretrain_radar  S2  frozen backbone, RADAR only (L_det + L_rec)                            -> pre.pth
   train_radar     S3  joint training, full loss (add --freeze_backbone for the plug-in)      -> radar.pth / plugin.pth
-  eval                B0, B1, B2 (Hampel), Ours, Ours-plugin x {clean, T1 raw/scaled, T2 k=4/8, T3 flatline}
+  eval                B0, B1 (GTR+Aug), B2 (Hampel), Ours-plugin [+ Ours ablation] x {clean, T1_raw, T2_k4}
   summarize           results_radar/raw/*.json -> results_radar/summary.csv (+ markdown tables)
   plot                figures_radar/ (dependency profiles, example windows)
   repro_check         compare S0 test MSE with the original run.py (see run_orig.py)
@@ -139,7 +139,10 @@ def build_parser():
     g.add_argument('--use_tf32', type=int, default=1)
     g.add_argument('--quick', action='store_true', default=False, help='1 seed (2024), pred_len 96')
     g.add_argument('--skip_existing', type=int, default=0, help='skip a training stage if its checkpoint exists')
-    g.add_argument('--methods', type=str, default='B0,B1,B2,Ours,Ours-plugin')
+    g.add_argument('--methods', type=str, default='B0,B1,B2,Ours-plugin',
+                   help='add Ours for the joint-training ablation')
+    g.add_argument('--conditions', type=str, default='clean,T1_raw,T2_k4',
+                   help='test conditions; all: clean,T1_raw,T1_scaled,T2_k4,T2_k8,T3_flat')
     g.add_argument('--radar_ckpt_dir', type=str, default='./checkpoints_radar/')
     g.add_argument('--results_dir', type=str, default='./results_radar/')
     g.add_argument('--fig_dir', type=str, default='./figures_radar/')
@@ -152,6 +155,17 @@ def set_seed(seed):
     random.seed(seed)
     torch.manual_seed(seed)
     np.random.seed(seed)
+
+
+def _conditions(args):
+    from radar.perturb import ALL_CONDITIONS
+    conds = [c.strip() for c in args.conditions.split(',') if c.strip()]
+    bad = [c for c in conds if c not in ALL_CONDITIONS]
+    if bad:
+        raise SystemExit(f'unknown condition(s) {bad}; choose from {ALL_CONDITIONS}')
+    if 'clean' not in conds:
+        conds = ['clean'] + conds
+    return conds
 
 
 def raw_dir(args):
@@ -178,7 +192,7 @@ def main():
     cmd = args.command
     if cmd == 'summarize':
         from radar.summary import summarize
-        summarize(args.results_dir)
+        summarize(args.results_dir, conditions=_conditions(args))
         return
 
     from exp.exp_radar import Exp_Radar, ckpt_paths, setting_name
@@ -240,7 +254,7 @@ def main():
 
     elif cmd == 'eval':
         methods = [m.strip() for m in args.methods.split(',') if m.strip()]
-        Exp_Radar(args, use_radar=False).evaluate_all(methods, raw_dir(args))
+        Exp_Radar(args, use_radar=False).evaluate_all(methods, raw_dir(args), conditions=_conditions(args))
 
     elif cmd == 'plot':
         from radar.plotting import plot_all

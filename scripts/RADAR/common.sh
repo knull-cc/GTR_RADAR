@@ -9,7 +9,8 @@
 #   REPRO_STRICT=1   stop if |S0 - run.py| / run.py >= 2%  (default 1)
 #   BACKBONE=GTR     GTR | GTRiTransformer | GTRPatchTST | GTRDLinear
 #   EXTRA_ARGS="..." extra run.py-compatible args for every call (e.g. "--num_workers 4")
-#   RADAR_ARGS="..." extra RADAR-only args (e.g. "--hind_level channel")
+#   RADAR_ARGS="..." extra RADAR-only args (e.g. "--hind_level channel", "--conditions clean,T1_raw,T2_k4,T3_flat")
+#   ABLATION=1       also train/evaluate Ours (joint training, backbone fine-tuned) as an ablation
 #   SKIP_EXISTING=1  reuse checkpoints that already exist (default 1; set 0 to retrain)
 #   PY=python  LOG_DIR=./logs_radar  RESULTS_DIR=./results_radar/  CKPT_DIR=./checkpoints_radar/
 set -eo pipefail
@@ -22,6 +23,7 @@ else
   PRED_LENS=${PRED_LENS:-"96 192 336 720"}; SEEDS=${SEEDS:-"2024 2025 2026"}; REPRO=${REPRO:-0}
 fi
 REPRO_STRICT=${REPRO_STRICT:-1}
+ABLATION=${ABLATION:-0}
 PY=${PY:-python}
 LOG_DIR=${LOG_DIR:-./logs_radar}
 RESULTS_DIR=${RESULTS_DIR:-./results_radar/}
@@ -65,9 +67,13 @@ run_one() {
   fi
   $PY -u run_radar.py train_aug      "${common[@]}" 2>&1 | tee "${log}__S1.log"
   $PY -u run_radar.py pretrain_radar "${common[@]}" 2>&1 | tee "${log}__S2.log"
-  $PY -u run_radar.py train_radar    "${common[@]}" 2>&1 | tee "${log}__S3.log"
   $PY -u run_radar.py train_radar    "${common[@]}" --freeze_backbone 2>&1 | tee "${log}__S3plugin.log"
-  $PY -u run_radar.py eval           "${common[@]}" 2>&1 | tee "${log}__eval.log"
+  local methods="B0,B1,B2,Ours-plugin"
+  if [ "$ABLATION" = "1" ]; then  # joint training (backbone also fine-tuned) = ablation only
+    $PY -u run_radar.py train_radar  "${common[@]}" 2>&1 | tee "${log}__S3.log"
+    methods="$methods,Ours"
+  fi
+  $PY -u run_radar.py eval           "${common[@]}" --methods "$methods" 2>&1 | tee "${log}__eval.log"
 }
 
 run_diag_one() {
@@ -100,7 +106,8 @@ run_all() {
       run_one "$pred_len" "$seed"
     done
   done
-  $PY -u run_radar.py summarize --results_dir "$RESULTS_DIR" 2>&1 | tee "$LOG_DIR/summary_${model_id_name}.log"
+  # shellcheck disable=SC2086
+  $PY -u run_radar.py summarize --results_dir "$RESULTS_DIR" $RADAR_ARGS 2>&1 | tee "$LOG_DIR/summary_${model_id_name}.log"
   local p0 s0
   p0=$(echo $PRED_LENS | awk '{print $1}'); s0=$(echo $SEEDS | awk '{print $1}')
   # shellcheck disable=SC2086

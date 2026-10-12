@@ -1,4 +1,8 @@
-"""Aggregate results_radar/raw/*.json into summary.csv / summary_extras.csv / summary.md and print markdown."""
+"""Aggregate results_radar/raw/*.json into summary.csv / summary_extras.csv / summary.md and print markdown.
+
+Main protocol: conditions clean / T1_raw / T2_k4; methods B0, B1 (GTR+Aug), B2 (GTR+Hampel), Ours-plugin.
+Ours (joint training) is reported only in a separate ablation table.
+"""
 import csv
 import glob
 import json
@@ -7,9 +11,15 @@ from collections import defaultdict
 
 import numpy as np
 
-from radar.perturb import TEST_CONDITIONS
+from radar.perturb import ALL_CONDITIONS, TEST_CONDITIONS
 
-METHODS = ('B0', 'B1', 'B2', 'Ours', 'Ours-plugin')
+MAIN_METHODS = ('B0', 'B1', 'B2', 'Ours-plugin')
+ABLATION_METHODS = ('Ours',)
+ALL_METHODS = MAIN_METHODS + ABLATION_METHODS
+BASELINES = ('B0', 'B1', 'B2')
+OURS = 'Ours-plugin'
+METHOD_LABEL = {'B0': 'B0 GTR', 'B1': 'B1 GTR+Aug', 'B2': 'B2 GTR+Hampel', 'Ours-plugin': 'Ours-plugin',
+                'Ours': 'Ours (joint)'}
 DATASET_ORDER = ['etth1', 'ettm1', 'weather', 'etth2', 'ettm2', 'solar', 'electricity', 'traffic']
 
 
@@ -22,7 +32,7 @@ def _ms(vals):
     v = np.asarray(vals, dtype=np.float64)
     if v.size == 0:
         return float('nan'), float('nan')
-    return float(v.mean()), float(v.std(ddof=1)) if v.size > 1 else 0.0
+    return float(v.mean()), (float(v.std(ddof=1)) if v.size > 1 else 0.0)
 
 
 def _fmt(m, s, nd=4):
@@ -52,7 +62,8 @@ def load(raw_dir):
     return evals, repro
 
 
-def summarize(results_dir='./results_radar/', print_tables=True):
+def summarize(results_dir='./results_radar/', conditions=TEST_CONDITIONS, print_tables=True):
+    conditions = [c for c in ALL_CONDITIONS if c in set(conditions)]
     raw_dir = os.path.join(results_dir, 'raw')
     evals, repro = load(raw_dir)
     if not evals:
@@ -63,47 +74,46 @@ def summarize(results_dir='./results_radar/', print_tables=True):
     tab = defaultdict(dict)
     extras = defaultdict(dict)  # (ds, H, method) -> {seed: res}
     for r in evals:
+        if r['method'] not in ALL_METHODS:
+            continue
         key = (r['dataset'], r['pred_len'])
         for cond, v in r['conditions'].items():
-            tab[key + (r['method'], cond)][r['seed']] = (v['mse'], v['mae'])
+            if cond in conditions:
+                tab[key + (r['method'], cond)][r['seed']] = (v['mse'], v['mae'])
         extras[key + (r['method'],)][r['seed']] = r
 
     keys = sorted({(k[0], k[1]) for k in tab}, key=lambda k: (_ds_key(k[0]), k[1]))
     stats = {}
     for (ds, H, m, cond), d in tab.items():
         seeds = sorted(d)
-        mse = [d[s][0] for s in seeds]
-        mae = [d[s][1] for s in seeds]
         clean = tab.get((ds, H, m, 'clean'), {})
-        degr = [d[s][0] / clean[s][0] for s in seeds if s in clean]
-        stats[(ds, H, m, cond)] = dict(seeds=seeds, mse=_ms(mse), mae=_ms(mae), degr=_ms(degr))
+        stats[(ds, H, m, cond)] = dict(seeds=seeds, mse=_ms([d[s][0] for s in seeds]),
+                                       mae=_ms([d[s][1] for s in seeds]),
+                                       degr=_ms([d[s][0] / clean[s][0] for s in seeds if s in clean]))
 
-    # ---------------- CSV
+    # ---------------- CSV (all methods incl. ablation)
     os.makedirs(results_dir, exist_ok=True)
     csv_fn = os.path.join(results_dir, 'summary.csv')
     with open(csv_fn, 'w', newline='') as f:
         w = csv.writer(f)
-        w.writerow(['dataset', 'pred_len', 'method', 'condition', 'n_seeds', 'seeds', 'mse_mean', 'mse_std',
-                    'mae_mean', 'mae_std', 'degradation_mean', 'degradation_std',
-                    'mse_impr_vs_B0', 'mse_impr_vs_B1', 'mae_impr_vs_B0', 'mae_impr_vs_B1'])
+        hdr = ['dataset', 'pred_len', 'method', 'condition', 'n_seeds', 'seeds', 'mse_mean', 'mse_std',
+               'mae_mean', 'mae_std', 'degradation_mean', 'degradation_std']
+        hdr += [f'{mt}_impr_vs_{b}' for mt in ('mse', 'mae') for b in BASELINES]
+        w.writerow(hdr)
         for ds, H in keys:
-            for cond in TEST_CONDITIONS:
-                b0 = stats.get((ds, H, 'B0', cond))
-                b1 = stats.get((ds, H, 'B1', cond))
-                for m in METHODS:
+            for cond in conditions:
+                for m in ALL_METHODS:
                     s = stats.get((ds, H, m, cond))
                     if s is None:
                         continue
-
-                    def impr(base, idx):
-                        if base is None:
-                            return ''
-                        bm, om = base[idx][0], s[idx][0]
-                        return (bm - om) / bm if bm else ''
-
+                    imps = []
+                    for mt in ('mse', 'mae'):
+                        for b in BASELINES:
+                            sb = stats.get((ds, H, b, cond))
+                            bm = sb[mt][0] if sb else None
+                            imps.append((bm - s[mt][0]) / bm if bm else '')
                     w.writerow([ds, H, m, cond, len(s['seeds']), ' '.join(map(str, s['seeds'])),
-                                *s['mse'], *s['mae'], *s['degr'],
-                                impr(b0, 'mse'), impr(b1, 'mse'), impr(b0, 'mae'), impr(b1, 'mae')])
+                                *s['mse'], *s['mae'], *s['degr'], *imps])
 
     # ---------------- extras CSV
     ex_fn = os.path.join(results_dir, 'summary_extras.csv')
@@ -153,38 +163,56 @@ def summarize(results_dir='./results_radar/', print_tables=True):
             md.append('| ' + ' | '.join(row) + ' |')
         md.append('')
 
-    present = [m for m in METHODS if any(k[2] == m for k in stats)]
+    main = [m for m in MAIN_METHODS if any(k[2] == m for k in stats)]
+    comps = [b for b in BASELINES if b in main] if OURS in main else []
     for metric in ('mse', 'mae'):
-        for cond in TEST_CONDITIONS:
-            md.append(f'### {metric.upper()} — {cond}  (mean ± std over seeds; Δ = (B − Ours)/B, positive = better)')
-            hdr = ['Dataset', 'H', 'seeds'] + present
-            comps = [(o, b) for o in ('Ours', 'Ours-plugin') if o in present for b in ('B0', 'B1') if b in present]
-            hdr += [f'{o} vs {b}' for o, b in comps]
+        for cond in conditions:
+            md.append(f'### {metric.upper()} — {cond}  (mean ± std over seeds; Δ = (B − Ours-plugin)/B, '
+                      f'+ = Ours-plugin better)')
+            hdr = ['Dataset', 'H', 'seeds'] + [METHOD_LABEL[m] for m in main] + [f'Δ vs {b}' for b in comps]
             rows = []
             for ds, H in keys:
-                if not any((ds, H, m, cond) in stats for m in present):
+                if not any((ds, H, m, cond) in stats for m in main):
                     continue
-                n = max(len(stats[(ds, H, m, cond)]['seeds']) for m in present if (ds, H, m, cond) in stats)
+                n = max(len(stats[(ds, H, m, cond)]['seeds']) for m in main if (ds, H, m, cond) in stats)
                 row = [ds, str(H), str(n)]
-                for m in present:
+                for m in main:
                     s = stats.get((ds, H, m, cond))
                     row.append(_fmt(*s[metric]) if s else '–')
-                for o, b in comps:
-                    so, sb = stats.get((ds, H, o, cond)), stats.get((ds, H, b, cond))
+                so = stats.get((ds, H, OURS, cond))
+                for b in comps:
+                    sb = stats.get((ds, H, b, cond))
                     row.append(_pct(sb[metric][0], so[metric][0]) if so and sb else '–')
                 rows.append(row)
             table(hdr, rows)
 
-    md.append('### Degradation rate = MSE(perturbed) / MSE(clean)  (mean over seeds)')
-    pert = [c for c in TEST_CONDITIONS if c != 'clean']
-    rows = []
-    for ds, H in keys:
-        for m in present:
-            if (ds, H, m, 'clean') not in stats:
+    pert = [c for c in conditions if c != 'clean']
+    if pert:
+        md.append('### Degradation rate = MSE(perturbed) / MSE(clean)  (mean over seeds)')
+        rows = []
+        for ds, H in keys:
+            for m in main:
+                if (ds, H, m, 'clean') not in stats:
+                    continue
+                rows.append([ds, str(H), METHOD_LABEL[m]] +
+                            [f"{stats[(ds, H, m, c)]['degr'][0]:.3f}" if (ds, H, m, c) in stats else '–'
+                             for c in pert])
+        table(['Dataset', 'H', 'Method'] + pert, rows)
+
+    # ablation: joint training vs plug-in
+    if any(k[2] == 'Ours' for k in stats):
+        md.append('### Ablation — Ours (joint: backbone also fine-tuned) vs Ours-plugin (backbone frozen), MSE')
+        hdr = ['Dataset', 'H'] + [f'{c}: plugin / joint' for c in conditions]
+        rows = []
+        for ds, H in keys:
+            if (ds, H, 'Ours', 'clean') not in stats:
                 continue
-            rows.append([ds, str(H), m] + [f"{stats[(ds, H, m, c)]['degr'][0]:.3f}" if (ds, H, m, c) in stats else '–'
-                                           for c in pert])
-    table(['Dataset', 'H', 'Method'] + pert, rows)
+            row = [ds, str(H)]
+            for c in conditions:
+                sp, sj = stats.get((ds, H, OURS, c)), stats.get((ds, H, 'Ours', c))
+                row.append(f"{sp['mse'][0]:.4f} / {sj['mse'][0]:.4f}" if sp and sj else '–')
+            rows.append(row)
+        table(hdr, rows)
 
     rows = []
     for r in ex_rows:
@@ -195,9 +223,9 @@ def summarize(results_dir='./results_radar/', print_tables=True):
             v = r.get(k, float('nan'))
             return '–' if v != v else f'{v:.3f}'
 
-        rows.append([r['dataset'], str(r['pred_len']), r['method'], f3('mean_alpha_clean'), f3('mean_alpha_T1_raw'),
-                     f3('frac_alpha_gt_0.5_clean'), f3('frac_alpha_gt_0.5_T1_raw'), f3('alpha_last_point_T1_raw'),
-                     f3('T1_last_point_auroc'),
+        rows.append([r['dataset'], str(r['pred_len']), METHOD_LABEL[r['method']], f3('mean_alpha_clean'),
+                     f3('mean_alpha_T1_raw'), f3('frac_alpha_gt_0.5_clean'), f3('frac_alpha_gt_0.5_T1_raw'),
+                     f3('alpha_last_point_T1_raw'), f3('T1_last_point_auroc'),
                      '/'.join(f3(f'pi_{n}_clean') for n in ('repairer', 'localmedian', 'cycleprior')),
                      '/'.join(f3(f'pi_{n}_T1_raw') for n in ('repairer', 'localmedian', 'cycleprior')),
                      f3('time_ratio_vs_B0'), r.get('mean_dbar_per_patch_clean', '')])

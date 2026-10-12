@@ -2,7 +2,7 @@
 
 1. dependency_<dataset>_pl<H>.png : mean d̄ per patch (oldest -> newest) from the eval JSONs (clean test set).
 2. examples_<dataset>_pl<H>_seed<s>_w<i>.png : clean vs T1 input, RADAR-repaired input, per-point α strip,
-   CyclePrior expert output, and B0 / B1 / Ours forecasts against the ground truth.
+   CyclePrior expert output, and B0 / B1 / Ours-plugin forecasts against the ground truth.
 """
 import glob
 import json
@@ -92,12 +92,13 @@ def plot_examples(exp, fig_dir, n_examples=3):
     args = exp.args
     paths = ckpt_paths(args)
     models = {}
-    for m in ('B0', 'B1', 'Ours'):
+    for m in ('B0', 'B1', 'Ours-plugin', 'Ours'):
         model, _ = exp.load_method(m, paths)
         if model is not None:
             models[m] = model
-    if 'Ours' not in models:
-        print('[plot] no Ours checkpoint for this setting; example windows skipped')
+    ours = 'Ours-plugin' if 'Ours-plugin' in models else ('Ours' if 'Ours' in models else None)
+    if ours is None:
+        print('[plot] no Ours-plugin / Ours checkpoint for this setting; example windows skipped')
         return []
     os.makedirs(fig_dir, exist_ok=True)
     test_ds, _ = exp.get_data('test')
@@ -106,7 +107,7 @@ def plot_examples(exp, fig_dir, n_examples=3):
     rz = exp.raw_zero('raw')
     ch = -1  # target / last channel ('OT' for ETT & Weather)
     made = []
-    W = models['Ours']
+    W = models[ours]
     for k, idx in enumerate(idxs):
         bx, by, _, _, bc = test_ds[idx]
         x = torch.as_tensor(np.asarray(bx)).float().unsqueeze(0).to(exp.device)
@@ -116,7 +117,7 @@ def plot_examples(exp, fig_dir, n_examples=3):
         preds = {}
         with torch.no_grad():
             exp._set_probe_seed(W, args.random_seed)
-            preds['Ours'] = W(x_t1, c)[0, -args.pred_len:, ch].cpu().numpy()
+            preds[ours] = W(x_t1, c)[0, -args.pred_len:, ch].cpu().numpy()
             aux = {kk: v.detach() for kk, v in W.last_aux.items()}
             for m in ('B0', 'B1'):
                 if m in models:
@@ -167,7 +168,7 @@ def plot_examples(exp, fig_dir, n_examples=3):
         hist = min(48, L)
         ax2.plot(np.arange(-hist + 1, 1), xc[-hist:], color=INK, lw=1.0, alpha=0.6)
         ax2.plot(t_out, truth, color=INK, lw=1.8, label='ground truth')
-        for m, col in (('B0', C_B0), ('B1', C_B1), ('Ours', C_OURS)):
+        for m, col in (('B0', C_B0), ('B1', C_B1), (ours, C_OURS)):
             if m in preds:
                 mse = float(np.mean((preds[m] - truth) ** 2))
                 ax2.plot(t_out, preds[m], color=col, lw=1.6, label=f'{m} on T1 input (ch. MSE {mse:.3f})')

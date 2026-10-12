@@ -28,7 +28,7 @@ from radar.perturb import TEST_CONDITIONS, MixturePerturber, apply_test_perturba
 from radar.radar import RADARWrapper
 from utils.tools import adjust_learning_rate
 
-METHODS = ('B0', 'B1', 'B2', 'Ours', 'Ours-plugin')
+METHODS = ('B0', 'B1', 'B2', 'Ours-plugin')  # main protocol; 'Ours' (joint training) = ablation
 
 
 class EarlyStopper:
@@ -529,7 +529,7 @@ class Exp_Radar(Exp_Main):
         m.eval()
         return m, (self.hampel() if method == 'B2' else None)
 
-    def evaluate_all(self, methods=METHODS, out_dir='results_radar/raw'):
+    def evaluate_all(self, methods=METHODS, out_dir='results_radar/raw', conditions=TEST_CONDITIONS):
         args = self.args
         paths = ckpt_paths(args)
         setting = setting_name(args)
@@ -541,7 +541,7 @@ class Exp_Radar(Exp_Main):
                 print(f'[eval] {method}: checkpoint missing, skipped')
                 continue
             print(f'[eval] {method} ({setting})')
-            res = self.test(model=model, preprocess=pre)
+            res = self.test(model=model, preprocess=pre, conditions=tuple(conditions))
             res.update(dict(kind='eval', method=method, setting=setting, dataset=args.model_id.split('_')[0],
                             data=args.data, backbone=args.backbone, pred_len=args.pred_len, seed=args.random_seed,
                             zero_mode=args.zero_mode, dep_mode=args.dep_mode,
