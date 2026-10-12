@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+dataset/
+checkpoints/
+checkpoints_radar/
+logs_radar/
+test_results/
+results/
+result.txt
