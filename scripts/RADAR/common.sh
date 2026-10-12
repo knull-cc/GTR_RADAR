@@ -70,8 +70,31 @@ run_one() {
   $PY -u run_radar.py eval           "${common[@]}" 2>&1 | tee "${log}__eval.log"
 }
 
+run_diag_one() {
+  local pred_len=$1 seed=$2
+  local mid=${model_id_name}_${seq_len}_${pred_len}
+  local setting=${mid}_${BACKBONE}_${data_name}_ftM_sl${seq_len}_pl${pred_len}_cycle${cycle}_seed${seed}
+  local data_args=(--root_path "$root_path_name" --data_path "$data_path_name" --model_id "$mid" --data "$data_name"
+                   --pred_len "$pred_len" --random_seed "$seed")
+  # shellcheck disable=SC2206
+  local common=("${data_args[@]}" "${GTR_ARGS[@]}" --backbone "$BACKBONE" --radar_ckpt_dir "$CKPT_DIR"
+                --results_dir "$RESULTS_DIR" --skip_existing 1 $EXTRA_ARGS $RADAR_ARGS)
+  local log=$LOG_DIR/$setting
+  echo "================ [diag] $setting ================"
+  $PY -u run_radar.py train_base "${common[@]}" 2>&1 | tee "${log}__S0.log"
+  if [ "${DIAG_PLUGIN:-0}" = "1" ]; then
+    $PY -u run_radar.py pretrain_radar "${common[@]}" 2>&1 | tee "${log}__S2.log"
+    $PY -u run_radar.py train_radar "${common[@]}" --freeze_backbone 2>&1 | tee "${log}__S3plugin.log"
+  fi
+  $PY -u diag_clean.py "${common[@]}" 2>&1 | tee "${log}__diag.log"
+}
+
 run_all() {
   check_data
+  if [ "${MODE:-full}" = "diag" ]; then
+    for pred_len in $PRED_LENS; do for seed in $SEEDS; do run_diag_one "$pred_len" "$seed"; done; done
+    return
+  fi
   for pred_len in $PRED_LENS; do
     for seed in $SEEDS; do
       run_one "$pred_len" "$seed"
