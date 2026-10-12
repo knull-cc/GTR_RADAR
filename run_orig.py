@@ -24,7 +24,7 @@ _metric = exp_main.metric
 
 def _capture(pred, true):
     res = _metric(pred, true)
-    _captured.append([float(v) for v in res])
+    _captured.append([float(res[0]), float(res[1])])  # mae, mse (CORR is an array, not a scalar)
     return res
 
 

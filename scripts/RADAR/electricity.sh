@@ -3,7 +3,7 @@
 # Usage: bash scripts/RADAR/electricity.sh   (QUICK=1 for 1 seed / pred_len 96; see common.sh for knobs)
 model_name=GTR
 
-root_path_name=./dataset/
+root_path_name=./dataset/electricity/
 data_path_name=electricity.csv
 model_id_name=Electricity
 data_name=custom

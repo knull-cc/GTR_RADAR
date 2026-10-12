@@ -3,7 +3,7 @@
 # Usage: bash scripts/RADAR/solar.sh   (QUICK=1 for 1 seed / pred_len 96; see common.sh for knobs)
 model_name=GTR
 
-root_path_name=./dataset/
+root_path_name=./dataset/Solar/
 data_path_name=solar_AL.txt
 model_id_name=Solar
 data_name=Solar

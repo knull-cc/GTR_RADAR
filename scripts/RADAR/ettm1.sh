@@ -3,7 +3,7 @@
 # Usage: bash scripts/RADAR/ettm1.sh   (QUICK=1 for 1 seed / pred_len 96; see common.sh for knobs)
 model_name=GTR
 
-root_path_name=./dataset/
+root_path_name=./dataset/ETT-small/
 data_path_name=ETTm1.csv
 model_id_name=ETTm1
 data_name=ETTm1

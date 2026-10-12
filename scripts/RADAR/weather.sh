@@ -3,7 +3,7 @@
 # Usage: bash scripts/RADAR/weather.sh   (QUICK=1 for 1 seed / pred_len 96; see common.sh for knobs)
 model_name=GTR
 
-root_path_name=./dataset/
+root_path_name=./dataset/weather/
 data_path_name=weather.csv
 model_id_name=weather
 data_name=custom

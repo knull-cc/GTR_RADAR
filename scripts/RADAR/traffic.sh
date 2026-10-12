@@ -3,7 +3,7 @@
 # Usage: bash scripts/RADAR/traffic.sh   (QUICK=1 for 1 seed / pred_len 96; see common.sh for knobs)
 model_name=GTR
 
-root_path_name=./dataset/
+root_path_name=./dataset/traffic/
 data_path_name=traffic.csv
 model_id_name=traffic
 data_name=custom
