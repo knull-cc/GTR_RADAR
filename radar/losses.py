@@ -124,12 +124,14 @@ def radar_loss(y_hat, y, aux, x_clean, pert_mask, rec_mask_pts=None, hind=None, 
     if stage == 'B':
         l_hind = hind if hind is not None else torch.zeros((), device=y_hat.device)
         total = mse + lam_hind * l_hind
-        return total, dict(mse=mse.item(), det=0.0, rec=0.0, hind=float(l_hind), alpha=aux['alpha'].mean().item())
+        return total, dict(mse=mse.item(), det=0.0, rec=0.0, hind=float(l_hind.detach()),
+                           alpha=aux['alpha'].mean().item())
     l_det = det_loss(aux['logit'], pert_mask, pos_weight, neg_weight)
     select = pert_mask if rec_mask_pts is None else (pert_mask | rec_mask_pts)
     l_rec = rec_loss(aux['u_hat'], x_clean, select, u_clip, aux['m'], aux['s'])
     l_hind = hind if hind is not None else torch.zeros((), device=y_hat.device)
     l_alpha = aux['alpha'].mean()
     total = mse + lam_det * l_det + lam_rec * l_rec + lam_hind * l_hind + lam_alpha * l_alpha
-    parts = dict(mse=mse.item(), det=l_det.item(), rec=l_rec.item(), hind=float(l_hind), alpha=l_alpha.item())
+    parts = dict(mse=mse.item(), det=l_det.item(), rec=l_rec.item(), hind=float(l_hind.detach()),
+                 alpha=l_alpha.item())
     return total, parts

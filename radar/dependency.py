@@ -32,9 +32,7 @@ def hutchinson_dependency(backbone, x, cycle_index, pred_len, n_probes=4, genera
         def forward_fn(z):
             out = backbone(z, cycle_index)
             return out[0] if isinstance(out, (tuple, list)) else out
-    was_training = backbone.training
-    backbone.eval()
-    try:
+    def _estimate():
         with torch.enable_grad():
             x_req = x.detach().clone().requires_grad_(True)
             out = forward_fn(x_req)[:, -pred_len:, :]
@@ -43,7 +41,20 @@ def hutchinson_dependency(backbone, x, cycle_index, pred_len, n_probes=4, genera
                 v = _probe(out.shape, out.device, out.dtype, generator, dist)
                 (g,) = torch.autograd.grad((out * v).sum(), x_req, retain_graph=k < n_probes - 1)
                 D = D + g.detach() ** 2
-            D = D / n_probes
+            return D / n_probes
+
+    was_training = backbone.training
+    backbone.eval()
+    try:
+        try:
+            D = _estimate()
+        except RuntimeError as e:
+            # some backbones normalise in place (e.g. GTRiTransformer: `x_enc /= stdev`), which breaks autograd
+            # w.r.t. the input; retry with PyTorch's copy-on-mutation of saved tensors (original files untouched)
+            if 'inplace operation' not in str(e):
+                raise
+            with torch.autograd.graph.allow_mutation_on_saved_tensors():
+                D = _estimate()
     finally:
         backbone.train(was_training)
     return D.detach()
