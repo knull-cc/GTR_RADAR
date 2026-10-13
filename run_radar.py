@@ -115,7 +115,7 @@ def build_parser():
     g.add_argument('--scale_min', type=float, default=1e-2, help='robust scale absolute floor')
     g.add_argument('--e2_k', type=int, default=3, help='E2: reliable neighbours per side')
     g.add_argument('--e2_thr', type=float, default=0.5, help='E2: reliability threshold')
-    g.add_argument('--e2_trend', type=int, default=1, help='E2: linear trend at the window end')
+    g.add_argument('--e2_trend', type=int, default=0, help='E2: linear trend at the window end (off: no gain on ETTh1)')
     g.add_argument('--dep_mode', type=str, default='ema', choices=['grad', 'ema'],
                    help='ema: backbone EMA profile (no inference overhead); grad: per-sample Hutchinson')
     g.add_argument('--dep_probes', type=int, default=4, help='Hutchinson probes K')
