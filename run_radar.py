@@ -132,8 +132,9 @@ def build_parser():
     g.add_argument('--lam_alpha', type=float, default=0.01)
     g.add_argument('--pos_weight', type=float, default=1.0, help='L_det weight on injected points')
     g.add_argument('--pu_neg_weight', type=float, default=0.1, help='L_det weight on natural (unlabeled) points')
-    g.add_argument('--plugin_train', type=str, default='gate', choices=['gate', 'all'],
-                   help='plug-in S3: gate = stage B (Router + gate only); all = every RADAR module')
+    g.add_argument('--plugin_train', type=str, default='all', choices=['gate', 'all'],
+                   help='plug-in S3 (backbone frozen): all = every RADAR module trained with the forecast loss '
+                        '(default, best so far); gate = Router + gate only')
     g.add_argument('--rec_mask_ratio', type=float, default=0.1)
     g.add_argument('--hind_level', type=str, default='sample', choices=['sample', 'channel'])
     g.add_argument('--radar_lr', type=float, default=1e-3)
