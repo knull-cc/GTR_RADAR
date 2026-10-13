@@ -137,10 +137,16 @@ def build_parser():
     g.add_argument('--rec_mask_ratio', type=float, default=0.1)
     g.add_argument('--hind_level', type=str, default='sample', choices=['sample', 'channel'])
     g.add_argument('--radar_lr', type=float, default=1e-3)
+    g.add_argument('--gate_lr', type=float, default=1e-2, help='lr of the gate scalars a, b, τ')
+    g.add_argument('--gate_a_init', type=float, default=4.0, help='initial softplus(a)')
+    g.add_argument('--gate_b_init', type=float, default=1.0, help='initial softplus(b)')
+    g.add_argument('--tau_calib_frac', type=float, default=0.01,
+                   help='stage B: init τ so this fraction of clean train points has α>0.5 (0 = off)')
+    g.add_argument('--tau_calib_batches', type=int, default=20)
     g.add_argument('--bb_lr_scale', type=float, default=0.1, help='backbone lr = scale * script lr (S1, S3)')
     g.add_argument('--ft_epochs', type=int, default=10, help='S1/S3 max epochs')
     g.add_argument('--ft_patience', type=int, default=3, help='S1/S3 patience')
-    g.add_argument('--pre_epochs', type=int, default=5, help='S2 epochs')
+    g.add_argument('--pre_epochs', type=int, default=20, help='S2 (stage A) epochs; best epoch kept by val')
     g.add_argument('--val_seed', type=int, default=20240917, help='fixed seed of the validation perturbations')
     g.add_argument('--mimic_test_rng', type=int, default=1,
                    help='S0: consume the global-RNG draw of the removed per-epoch test pass (exact run.py stream)')

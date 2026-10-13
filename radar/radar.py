@@ -63,8 +63,9 @@ class RADARWrapper(nn.Module):
         self.n_experts = len(EXPERTS)
         self.expert_names = EXPERTS
         self.router = Router(d, self.P, self.n_experts)
-        self.gate_a = nn.Parameter(torch.tensor(_inv_softplus(1.0)))
-        self.gate_b = nn.Parameter(torch.tensor(_inv_softplus(1.0)))
+        # softplus(a) = 4 makes the gate close to a switch in the unreliability logit (v1's effective slope was 20)
+        self.gate_a = nn.Parameter(torch.tensor(_inv_softplus(float(_cfg(cfg, 'gate_a_init', 4.0)))))
+        self.gate_b = nn.Parameter(torch.tensor(_inv_softplus(float(_cfg(cfg, 'gate_b_init', 1.0)))))
         self.tau_raw = nn.Parameter(torch.tensor(float(_cfg(cfg, 'tau_init', 1.0))))
         self.gate_eps = float(_cfg(cfg, 'gate_eps', 1e-2))
         self.logit_clip = 12.0
@@ -90,7 +91,24 @@ class RADARWrapper(nn.Module):
 
     def gate_parameters(self):
         """Stage B: Router + gate (a, b, τ)."""
-        return list(self.router.parameters()) + [self.gate_a, self.gate_b, self.tau_raw]
+        return list(self.router.parameters()) + self.gate_scalars()
+
+    def gate_scalars(self):
+        return [self.gate_a, self.gate_b, self.tau_raw]
+
+    @torch.no_grad()
+    def calibrate_dependency(self, x, *bb_args):
+        """Update the EMA dependency profile from one batch (any train/eval mode)."""
+        D = hutchinson_dependency(self.backbone, x, None, self.pred_len, self.dep_probes,
+                                  generator=self.probe_generator, dist=self.dep_dist,
+                                  forward_fn=self._closure(bb_args))
+        self.dep_profile.update(patch_sum(D, self.P))
+
+    @torch.no_grad()
+    def gate_logit_without_tau(self, x, *bb_args):
+        """softplus(a)·logit(1−R) + softplus(b)·log(D̃+ε) for every point (used to calibrate τ)."""
+        _, aux = self.repair(x, *bb_args)
+        return aux['gate_logit'] + self.tau_raw if not self.force_gate_zero else None
 
     def stage_a_parameters(self):
         return list(self.reliability.parameters()) + list(self.repairer.parameters())

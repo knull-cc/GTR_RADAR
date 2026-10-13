@@ -77,7 +77,7 @@ def ckpt_paths(args):
     os.makedirs(d, exist_ok=True)
     # RADAR v2 architecture (PU detection, reliable-neighbour expert, log-linear gate, staged training) uses new
     # file names, so v1 checkpoints are never loaded by mistake; base/aug (pure GTR) are shared.
-    names = dict(base='base', aug='aug', pre='pre_v2', radar='radar_v2', plugin='plugin_v2')
+    names = dict(base='base', aug='aug', pre='pre_v3', radar='radar_v3', plugin='plugin_v3')
     return {k: os.path.join(d, f'{v}.pth') for k, v in names.items()}
 
 
@@ -373,8 +373,12 @@ class Exp_Radar(Exp_Main):
 
         radar_lr = args.radar_lr
         bb_lr = args.bb_lr_scale * args.learning_rate
+        gate_lr = args.gate_lr
+        scalar_ids = {id(p) for p in W.gate_scalars()}
         trainable = W.gate_parameters() if stage_b else W.radar_parameters()
-        groups = [{'params': trainable, 'lr': radar_lr, 'lr0': radar_lr}]
+        rest = [p for p in trainable if id(p) not in scalar_ids]
+        groups = [{'params': rest, 'lr': radar_lr, 'lr0': radar_lr},
+                  {'params': W.gate_scalars(), 'lr': gate_lr, 'lr0': gate_lr}]  # a, b, τ: larger lr
         if not freeze_backbone:
             groups.append({'params': list(W.backbone.parameters()), 'lr': bb_lr, 'lr0': bb_lr})
         opt = optim.Adam(groups)
@@ -387,6 +391,8 @@ class Exp_Radar(Exp_Main):
         stopper = EarlyStopper(args.ft_patience, out_ckpt)
         tag = 'S3-plugin' if freeze_backbone else 'S3'
 
+        if stage_b and args.tau_calib_frac > 0:
+            self._calibrate_gate(W, train_loader)
         torch.manual_seed(args.random_seed + 7)  # same CPU RNG stream as S1 -> identical batches/perturbations
         s, cl, pe = self.val_score(W, val_pert)
         print(f'[{tag}] start: val_score {s:.6f} (clean {cl:.6f}, perturbed {pe:.6f})')
@@ -428,6 +434,35 @@ class Exp_Radar(Exp_Main):
         W.load_state_dict(torch.load(out_ckpt, map_location=self.device))
         for p in W.parameters():
             p.requires_grad_(True)
+
+    def _calibrate_gate(self, W, train_loader):
+        """Stage-B initialisation on CLEAN training windows (no val/test data):
+        1) fill the backbone's EMA dependency profile; 2) set τ so that only `tau_calib_frac` of clean points
+        have α > 0.5 (i.e. τ = (1 − frac)-quantile of the gate logit without τ)."""
+        args = self.args
+        nb = max(1, int(args.tau_calib_batches))
+        W.eval()
+        batches = []
+        for i, (bx, by, _, _, bc) in enumerate(train_loader):
+            if i >= nb:
+                break
+            x, _, c = self._to_dev(bx, by, bc)
+            batches.append((x, c))
+            W.calibrate_dependency(x, c)
+        zs = []
+        for x, c in batches:
+            z = W.gate_logit_without_tau(x, c)
+            if z is not None:
+                zs.append(z.flatten().float())
+        if not zs:
+            return
+        z = torch.cat(zs)
+        if z.numel() > 4_000_000:
+            z = z[torch.randperm(z.numel(), device=z.device)[:4_000_000]]
+        tau = torch.quantile(z, 1.0 - float(args.tau_calib_frac)).item()
+        W.tau_raw.data.fill_(tau)
+        print(f'[S3-plugin] calibrated on {len(batches)} clean train batches: D̄={W.dep_profile.scale().item():.4g}, '
+              f'τ={tau:.3f} (target α>0.5 on {100 * args.tau_calib_frac:.1f}% of clean points)')
 
     # ------------------------------------------------------------------ evaluation
     def test(self, setting=None, test=0, model=None, preprocess=None, conditions=TEST_CONDITIONS,
