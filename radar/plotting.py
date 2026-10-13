@@ -22,7 +22,7 @@ C_OURS = '#2a78d6'   # slot 1 blue   : RADAR (repaired input, Ours forecast)
 C_B0 = '#eb6834'     # slot 2 orange : B0
 C_B1 = '#1baf7a'     # slot 3 aqua   : B1
 C_PERT = '#e87ba4'   # slot 5 magenta: perturbed input
-C_CYC = '#6250d6'    # slot 7 violet : CyclePrior expert
+C_CYC = '#6250d6'    # slot 7 violet : reliable-neighbour expert (E2)
 
 
 def _style(ax):
@@ -70,8 +70,8 @@ def plot_dependency_profiles(results_dir, fig_dir, datasets=('ETTh1', 'weather')
             _style(ax)
             ax.set_xticks(np.arange(1, len(p) + 1))
             ax.set_xlabel('input patch (1 = oldest, rightmost = most recent)', color=INK, fontsize=9)
-            ax.set_ylabel(r'mean normalised dependency $\bar{d}$', color=INK, fontsize=9)
-            ax.set_ylim(0, 1.05)
+            ax.set_ylabel(r'mean dependency $\tilde{D}$ (units of $\bar{D}$)', color=INK, fontsize=9)
+            ax.set_ylim(bottom=0)
             ax.set_title(f'{ds}, H={H}: forecast dependency per input patch (clean test set)', fontsize=10,
                          color='#0b0b0b')
             if len(methods) > 1:
@@ -128,7 +128,7 @@ def plot_examples(exp, fig_dir, n_examples=3):
         xc = x[0, :, ch].cpu().numpy()
         xp = x_t1[0, :, ch].cpu().numpy()
         xr = aux['x_tilde'][0, :, ch].cpu().numpy()
-        cyc = aux['c'][0, :, ch, 2].cpu().numpy()
+        cyc = aux['c'][0, :, ch, 1].cpu().numpy()  # E2 reliable-neighbour expert
         alpha = aux['alpha'][0, :, ch].cpu().numpy()
         truth = y[0, -args.pred_len:, ch].cpu().numpy()
 
@@ -142,8 +142,7 @@ def plot_examples(exp, fig_dir, n_examples=3):
         ax1.plot(t_in, xc, color=INK, lw=1.6, label='clean input')
         ax1.plot(t_in, xp, color=C_PERT, lw=1.6, ls='--', label='T1 input (last point = raw 0)')
         ax1.plot(t_in, xr, color=C_OURS, lw=1.8, label=r'RADAR repaired $\tilde{x}$')
-        if W.use_cycle_prior:
-            ax1.plot(t_in, cyc, color=C_CYC, lw=1.2, ls=':', label=r'CyclePrior expert $c_3$')
+        ax1.plot(t_in, cyc, color=C_CYC, lw=1.2, ls=':', label=r'reliable-neighbour expert $c_2$')
         ax1.scatter([0], [xp[-1]], s=36, color=C_PERT, zorder=5, edgecolor='white', linewidth=1.5)
         ax1.scatter([0], [xr[-1]], s=36, color=C_OURS, zorder=6, edgecolor='white', linewidth=1.5)
         _style(ax1)

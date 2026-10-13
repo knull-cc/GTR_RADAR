@@ -1,4 +1,4 @@
-"""RADAR unit tests (B=4, L=96, C=7, H=96, cycle=24, randomly initialised GTR in eval mode).
+"""RADAR v2 unit tests (B=4, L=96, C=7, H=96, cycle=24; randomly initialised GTR in eval mode).
 
 Run from the repository root:  python -m pytest -q tests/test_radar.py
 """
@@ -18,10 +18,10 @@ if ROOT not in sys.path:
 
 import radar.compat  # noqa: E402,F401
 from models import GTR as GTR_module  # noqa: E402
-from radar.dependency import hutchinson_dependency, patch_dependency  # noqa: E402
-from radar.losses import hindsight_loss, hindsight_targets, patch_mask_to_points, radar_loss  # noqa: E402
-from radar.modules import (CyclePriorExpert, LocalMedianExpert, from_patches, gtr_gather_index,  # noqa: E402
-                           hampel_filter, to_patches)
+from radar.dependency import hutchinson_dependency, patch_sum  # noqa: E402
+from radar.losses import (det_loss, hindsight_loss, hindsight_targets, patch_mask_to_points,  # noqa: E402
+                          radar_loss, rec_loss)
+from radar.modules import ReliableNeighborExpert, from_patches, hampel_filter, robust_stats, to_patches  # noqa: E402
 from radar.perturb import MixturePerturber, apply_test_perturbation, perturb_batch, raw_zero_from_scaler  # noqa: E402
 from radar.radar import RADARWrapper  # noqa: E402
 
@@ -32,9 +32,10 @@ def make_cfg(**kw):
     cfg = types.SimpleNamespace(
         seq_len=L, pred_len=H, enc_in=C, cycle=CYCLE, d_model=512, dropout=0.5, use_revin=1, individual=0,
         radar_patch=8, radar_d=64, radar_heads=4, radar_layers=2, radar_dff=128, radar_dropout=0.1,
-        radar_chunk=8192, u_clip=10.0, tau_init=0.3, gate_T=0.05, dep_mode='grad', dep_probes=1, dep_ema=0.99,
-        use_cycle_prior=1, force_gate_zero=False,
-        lam_det=0.5, lam_rec=0.5, lam_hind=0.1, lam_alpha=0.01, pos_weight=10.0)
+        radar_chunk=8192, u_clip=10.0, tau_init=1.0, gate_eps=1e-2, dep_mode='grad', dep_probes=4,
+        dep_probe_dist='rademacher', dep_ema=0.99, force_gate_zero=False, e2_k=3, e2_thr=0.5, e2_trend=1,
+        scale_std_frac=0.1, scale_min=1e-2,
+        lam_det=0.5, lam_rec=0.5, lam_hind=0.5, lam_alpha=0.01, pos_weight=1.0, pu_neg_weight=0.1)
     for k, v in kw.items():
         setattr(cfg, k, v)
     return cfg
@@ -68,15 +69,16 @@ def test_output_shape_matches_backbone():
         y = W(x, ci)
     assert y.shape == y_bb.shape == (B, H, C)
     aux = W.last_aux
-    for k in ('logit', 'R', 'alpha', 'dbar', 'u_hat', 'x_tilde'):
+    for k in ('logit', 'R', 'alpha', 'dbar', 'u_hat', 'x_tilde', 'target'):
         assert aux[k].shape == (B, L, C), k
-    assert aux['pi'].shape == (B, L, C, 3)
+    assert aux['pi'].shape == (B, L, C, 2) and aux['c'].shape == (B, L, C, 2)
     assert aux['dbar_patch'].shape == (B, C, L // 8)
 
 
 # 2 ------------------------------------------------------------------------------------------------------
-def test_force_gate_zero_is_identity_and_init_alpha_small():
-    W, bb, _ = make_wrapper(force_gate_zero=True)
+@pytest.mark.parametrize('dep_mode', ['grad', 'ema'])
+def test_force_gate_zero_is_identity_and_init_alpha_small(dep_mode):
+    W, bb, _ = make_wrapper(force_gate_zero=True, dep_mode=dep_mode)
     x, ci = make_batch()
     with torch.no_grad():
         ref = bb(x, ci)
@@ -103,19 +105,18 @@ class LinearToy(nn.Module):
         return (x.reshape(x.shape[0], -1) @ self.W.t()).reshape(x.shape[0], H, C)
 
 
-def test_hutchinson_matches_exact_jacobian_column_energy():
+@pytest.mark.parametrize('dist', ['gaussian', 'rademacher'])
+def test_hutchinson_matches_exact_jacobian_column_energy(dist):
     toy = LinearToy()
     x, ci = make_batch()
     g = torch.Generator().manual_seed(123)
-    D = hutchinson_dependency(toy, x, ci, H, n_probes=256, generator=g)
+    D = hutchinson_dependency(toy, x, ci, H, n_probes=256, generator=g, dist=dist)
     exact = (toy.W.detach() ** 2).sum(0).reshape(L, C).unsqueeze(0).expand(B, L, C)
     rel = ((D - exact).norm() / exact.norm()).item()
-    assert rel < 0.10, rel  # expected ≈ sqrt(2/256) ≈ 0.088 for Gaussian probes
+    assert rel < 0.10, rel  # Gaussian ≈ sqrt(2/256) ≈ 0.088; Rademacher is lower
     assert toy.W.grad is None
-    dbar, Dp = patch_dependency(D, 8)
-    assert dbar.shape == (B, C, L // 8)
-    assert torch.allclose(dbar.amax(-1), torch.ones(B, C))
-    assert (dbar >= 0).all() and (dbar <= 1 + 1e-6).all()
+    Dp = patch_sum(D, 8)
+    assert Dp.shape == (B, C, L // 8) and torch.allclose(Dp.sum(-1), D.sum(1), rtol=1e-4)
 
 
 # 4 ------------------------------------------------------------------------------------------------------
@@ -135,53 +136,45 @@ def test_T1_changes_only_last_point_to_raw_zero_and_not_y():
     assert yp is y and torch.equal(y, y_copy)
     assert not mask[:, :-1, :].any() and mask[:, -1, :].all()
 
-    xs, _ = apply_test_perturbation(x, 'T1_scaled', rz)
-    assert torch.equal(xs[:, :-1], x[:, :-1]) and torch.count_nonzero(xs[:, -1]) == 0
-    xf, mf = apply_test_perturbation(x, 'T3_flat', rz)
-    assert torch.equal(xf[:, :-8], x[:, :-8]) and torch.equal(xf[:, -8:], x[:, -9:-8].expand(B, 8, C))
+    xk, mk = apply_test_perturbation(x, 'T2_k4', rz)
+    assert torch.equal(xk[:, :-4], x[:, :-4]) and mk[:, -4:].all()
     assert 'flatline' not in MixturePerturber.TYPES
-
     pert = MixturePerturber(rz, p_apply=1.0, seed=0)
     xm, mm, types_ = pert(x)
-    assert xm.shape == x.shape and mm.shape == x.shape and (types_ >= 0).all()
+    assert xm.shape == x.shape and (types_ >= 0).all()
     assert torch.equal(mm, (xm - x).abs() > 1e-6)
 
 
 # 5 ------------------------------------------------------------------------------------------------------
-def test_cycle_prior_zero_Q_and_gather_index():
-    _, bb, _ = make_wrapper()
-    x, ci = make_batch()
-    w = torch.rand(B, L, C, generator=torch.Generator().manual_seed(5))
-    expert = CyclePriorExpert()
+def test_reliable_neighbor_expert_and_scale_floor():
+    E2 = ReliableNeighborExpert(k=3, thr=0.5, trend=True)
+    g = torch.Generator().manual_seed(7)
+    x = torch.randn(1, 20, 1, generator=g)
+    x[:, -4:] = -5.0  # contiguous corruption of the last 4 points (T2_k4-like)
+    R = torch.ones_like(x)
+    R[:, -4:] = 0.0
+    c = E2(x, R)[0, :, 0]
+    z = x[0, :, 0]
+    # interior point: median of the 3 reliable points before and the 3 after (corrupted ones skipped)
+    t = 10
+    assert torch.allclose(c[t], torch.cat([z[t - 3:t], z[t + 1:t + 4]]).median())
+    # last point: nothing reliable after -> level (median) + OLS trend of the last 3 reliable points (13..15)
+    pts = z[13:16]
+    tt = torch.tensor([13.0, 14.0, 15.0])
+    slope = ((tt - tt.mean()) * (pts - pts.mean())).sum() / ((tt - tt.mean()) ** 2).sum()
+    assert torch.allclose(c[19], pts.median() + slope * (19 - tt.mean()), atol=1e-5)
+    assert not torch.isclose(c[19], torch.tensor(-5.0))  # a plain local median would return the zeroed value
+    # no reliable point at all -> window median, finite
+    c0 = E2(x, torch.zeros_like(x))
+    assert torch.isfinite(c0).all() and torch.allclose(c0[0, :, 0], z.median().expand(20))
 
-    assert torch.count_nonzero(bb.Q) == 0  # GTR initialises Q with zeros
-    c3, _ = expert(x, ci, bb.Q, w)
-    wmean = (w * x).sum(1, keepdim=True) / w.sum(1, keepdim=True)
-    assert torch.isfinite(c3).all()
-    assert torch.allclose(c3, wmean.expand_as(x), atol=1e-5)
-    c0, _ = expert(x, ci, bb.Q, torch.zeros_like(w))  # degenerate weights fall back to uniform
-    assert torch.isfinite(c0).all()
-
-    with torch.no_grad():
-        bb.Q.copy_(torch.randn_like(bb.Q))
-    captured = {}
-
-    def grab(module, inputs, output):  # returns None -> output untouched
-        captured['q'] = inputs[1].detach().clone()
-
-    hook = bb.GTR.register_forward_hook(grab)
-    with torch.no_grad():
-        bb(x, ci)
-    hook.remove()
-    c3, q = expert(x, ci, bb.Q, w)
-    assert torch.equal(q, captured['q'].permute(0, 2, 1))  # same Q rows GTR itself retrieved
-    ref = (ci.view(-1, 1) + torch.arange(L).view(1, -1)) % CYCLE  # formula of models/GTR.py
-    assert torch.equal(gtr_gather_index(ci, L, CYCLE), ref)
-    assert torch.isfinite(c3).all()
+    flat = torch.ones(2, 96, 3)
+    m, s = robust_stats(flat)
+    assert torch.allclose(s, torch.full_like(s, 1e-2)) and torch.isfinite((flat - m) / s).all()
 
 
 # 6 ------------------------------------------------------------------------------------------------------
-def test_gradients_reach_radar_modules_but_not_Q_through_cycle_prior():
+def test_gradients_joint_and_stage_b():
     W, bb, cfg = make_wrapper()
     x, ci = make_batch()
     y = torch.randn(B, H, C)
@@ -191,6 +184,7 @@ def test_gradients_reach_radar_modules_but_not_Q_through_cycle_prior():
     mask[:, -1, :] = True
     rec_mask = torch.rand(B * C, W.N, generator=torch.Generator().manual_seed(0)) < 0.1
 
+    # joint loss: every RADAR module receives a finite gradient
     y_hat = W(x_p, ci, rec_mask=rec_mask)
     aux = W.last_aux
     tg = hindsight_targets(W.backbone, x_p, ci, y, aux['target'].detach(), W.P, H)
@@ -198,18 +192,24 @@ def test_gradients_reach_radar_modules_but_not_Q_through_cycle_prior():
     total, _ = radar_loss(y_hat, y, aux, x, mask, patch_mask_to_points(rec_mask, B, C, L, W.P), hind, cfg)
     W.zero_grad(set_to_none=True)
     total.backward()
-
     for name, mod in (('ReliabilityNet', W.reliability), ('Repairer', W.repairer), ('Router', W.router)):
         for n, p in mod.named_parameters():
-            assert p.grad is not None, f'{name}.{n} has no grad'
-            assert torch.isfinite(p.grad).all(), f'{name}.{n} grad not finite'
-    assert W.tau_raw.grad is not None and torch.isfinite(W.tau_raw.grad).all()
+            assert p.grad is not None and torch.isfinite(p.grad).all(), f'{name}.{n}'
+    for p in (W.gate_a, W.gate_b, W.tau_raw):
+        assert p.grad is not None and torch.isfinite(p.grad).all()
 
-    # CyclePrior uses Q.detach(): no gradient path from its output to Q (x made differentiable on purpose)
-    x_req = x_p.clone().requires_grad_(True)
-    c3b, _ = W.cycle_prior(x_req, ci, bb.Q, aux['R'])
-    assert c3b.requires_grad
-    assert torch.autograd.grad(c3b.sum(), bb.Q, allow_unused=True)[0] is None
+    # stage B: backbone + stage-A modules frozen -> only Router and gate are trained
+    for p in list(W.backbone.parameters()) + W.stage_a_parameters():
+        p.requires_grad_(False)
+    W.zero_grad(set_to_none=True)
+    y_hat = W(x_p, ci)
+    aux = W.last_aux
+    tg = hindsight_targets(W.backbone, x_p, ci, y, aux['target'].detach(), W.P, H)
+    total, _ = radar_loss(y_hat, y, aux, x, mask, None, hindsight_loss(aux['alpha'], tg, W.P), cfg, stage='B')
+    total.backward()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in W.gate_parameters())
+    assert all(p.grad is None for p in W.stage_a_parameters())
+    assert all(p.grad is None for p in W.backbone.parameters())
 
 
 # 7 ------------------------------------------------------------------------------------------------------
@@ -231,37 +231,57 @@ def test_dependency_runs_under_no_grad_without_param_grads():
     assert all(p.grad is None for p in W.parameters())
 
 
-# extra sanity checks --------------------------------------------------------------------------------------
-def test_patch_roundtrip_and_local_median():
+# extra checks --------------------------------------------------------------------------------------------
+def test_losses_pu_and_rec_frame():
+    logit = torch.randn(2, 8, 3)
+    mask = torch.zeros(2, 8, 3, dtype=torch.bool)
+    mask[:, -1] = True
+    bce = torch.nn.functional.binary_cross_entropy_with_logits(logit, mask.float(), reduction='none')
+    w = torch.where(mask, torch.ones_like(bce), torch.full_like(bce, 0.1))
+    assert torch.allclose(det_loss(logit, mask, 1.0, 0.1), (w * bce).mean())
+
+    x_clean = torch.randn(2, 8, 3)
+    m, s = torch.zeros(2, 1, 3), torch.full((2, 1, 3), 2.0)
+    u_hat = x_clean / 2.0  # perfect reconstruction in the corrupted window's frame (m, s)
+    assert rec_loss(u_hat, x_clean, torch.ones_like(mask), 10.0, m, s).item() < 1e-10
+
+
+def test_patch_roundtrip_and_hampel():
     x, _ = make_batch()
     xp, pad = to_patches(x, 8)
-    assert pad == 0 and xp.shape == (B * C, L // 8, 8)
-    assert torch.equal(from_patches(xp, B, C, pad), x)
-    x2 = x[:, :93]  # L % P != 0 -> left replicate padding, cropped on output
+    assert pad == 0 and torch.equal(from_patches(xp, B, C, pad), x)
+    x2 = x[:, :93]
     xp2, pad2 = to_patches(x2, 8)
     assert pad2 == 3 and torch.equal(from_patches(xp2, B, C, pad2), x2)
-
-    lm = LocalMedianExpert(3)(x)
-    t = 50
-    nb = torch.cat([x[:, t - 3:t], x[:, t + 1:t + 4]], dim=1)
-    assert torch.equal(lm[:, t], nb.median(dim=1).values)
-    assert torch.equal(lm[:, -1], x[:, -4:-1].median(dim=1).values)  # last point uses t-3..t-1 only
     hf = hampel_filter(x)
     assert hf.shape == x.shape and torch.isfinite(hf).all()
 
 
-def test_ema_mode_and_training_forward():
+def test_ema_profile_and_global_scale():
     W, bb, cfg = make_wrapper(dep_mode='ema')
     x, ci = make_batch()
     W.train()
-    y = W(x, ci)
+    W(x, ci)
     assert bool(W.dep_profile.initialized)
     W.eval()
     with torch.no_grad():
-        y2 = W(x, ci)
-    assert y.shape == y2.shape == (B, H, C)
-    prof = W.dep_profile.profile()
+        W(x, ci)
+    prof = W.dep_profile.normalized()
+    assert torch.allclose(prof.mean(), torch.tensor(1.0), atol=1e-5)
     assert torch.allclose(W.last_aux['dbar_patch'][0, 0], prof)
+
+
+def test_tuple_returning_backbone_closure():
+    class TupleToy(LinearToy):
+        def forward(self, x, cycle_index):
+            return super().forward(x, cycle_index), None  # (output, attention)
+
+    toy = TupleToy()
+    W = RADARWrapper(toy, make_cfg()).eval()
+    x, ci = make_batch()
+    with torch.no_grad():
+        out = W(x, ci)
+    assert out.shape == (B, H, C)
 
 
 @pytest.mark.parametrize('name', ['GTRDLinear', 'GTRiTransformer', 'GTRPatchTST'])
@@ -279,4 +299,3 @@ def test_other_gtr_backbones(name):
         ref = bb(x, ci)
         out = W(x, ci)
     assert out.shape == ref.shape
-    assert W.use_cycle_prior

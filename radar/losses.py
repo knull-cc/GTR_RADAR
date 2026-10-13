@@ -1,7 +1,12 @@
 """RADAR losses.
 
-L = MSE(ŷ, y) + λ_det·L_det + λ_rec·L_rec + λ_hind·L_hind + λ_α·mean(α)
-    (defaults 0.5, 0.5, 0.1, 0.01)
+Stage A (pretrain_radar): L_det + L_rec                       (ReliabilityNet, Repairer)
+Stage B (plug-in)       : MSE(ŷ, y) + λ_hind·L_hind           (Router + gate a, b, τ)
+Joint ablation          : MSE + λ_det·L_det + λ_rec·L_rec + λ_hind·L_hind + λ_α·mean(α)   (0.5, 0.5, 0.5, 0.01)
+
+L_det is a PU (positive-unlabeled) loss: injected points are positives; natural points are *unlabeled* and only
+get a small negative weight (pu_neg_weight, default 0.1), so genuinely bad natural points can still be flagged.
+L_rec targets live in the corrupted window's robust coordinates (same frame as the Repairer input/output).
 """
 import torch
 import torch.nn.functional as F
@@ -9,21 +14,25 @@ import torch.nn.functional as F
 from radar.modules import points_to_patch_max, robust_stats
 
 
-def det_loss(logit, mask, pos_weight=10.0):
-    """BCE(ℓ_t, m_t) over all points; m_t = 1 for perturbed points."""
-    pw = torch.tensor(pos_weight, device=logit.device, dtype=logit.dtype)
-    return F.binary_cross_entropy_with_logits(logit, mask.to(logit.dtype), pos_weight=pw)
+def det_loss(logit, mask, pos_weight=1.0, neg_weight=0.1):
+    """PU detection loss: BCE(ℓ_t, m_t) with weight pos_weight on injected points (m_t = 1) and neg_weight on
+    natural (unlabeled) points; averaged over all points."""
+    t = mask.to(logit.dtype)
+    w = t * pos_weight + (1.0 - t) * neg_weight
+    return (w * F.binary_cross_entropy_with_logits(logit, t, reduction='none')).mean()
 
 
-def clean_u(x_clean, u_clip=10.0):
-    """Clean-window robust coordinates (target of the Repairer)."""
-    m, s = robust_stats(x_clean)
+def clean_u(x_clean, u_clip=10.0, m=None, s=None):
+    """Repairer target: clean values in the robust frame (m, s) of the window the Repairer actually saw
+    (the corrupted one). Without (m, s) the clean window's own statistics are used."""
+    if m is None or s is None:
+        m, s = robust_stats(x_clean)
     return ((x_clean - m) / s).clamp(-u_clip, u_clip)
 
 
-def rec_loss(u_hat, x_clean, select, u_clip=10.0):
-    """MSE(û_t, u_t^clean) on the selected points (perturbed ∪ randomly masked)."""
-    target = clean_u(x_clean, u_clip)
+def rec_loss(u_hat, x_clean, select, u_clip=10.0, m=None, s=None):
+    """MSE(û_t, (x_clean_t − m_corrupt)/s_corrupt) on the selected points (perturbed ∪ randomly masked)."""
+    target = clean_u(x_clean, u_clip, m, s)
     sel = select.to(u_hat.dtype)
     return ((u_hat - target) ** 2 * sel).sum() / sel.sum().clamp_min(1.0)
 
@@ -38,7 +47,7 @@ def patch_mask_to_points(rec_mask, B, C, L, P):
 
 @torch.no_grad()
 def hindsight_targets(backbone, x_in, cycle_index, y, repair, P, pred_len, f_dim=0, level='sample',
-                      generator=None):
+                      generator=None, forward_fn=None):
     """Counterfactual supervision for the gate.
 
     For every sample: the last patch and one random patch (≠ last). Under no_grad + backbone.eval():
@@ -48,6 +57,10 @@ def hindsight_targets(backbone, x_in, cycle_index, y, repair, P, pred_len, f_dim
     level='channel' keeps per-channel errors (exact for channel-independent backbones such as GTR).
     Returns dict(patches (B, 2), h (B, 2, C'), w (B, 2, C')).
     """
+    if forward_fn is None:
+        def forward_fn(z):
+            out = backbone(z, cycle_index)
+            return out[0] if isinstance(out, (tuple, list)) else out
     was_training = backbone.training
     backbone.eval()
     try:
@@ -62,7 +75,7 @@ def hindsight_targets(backbone, x_in, cycle_index, y, repair, P, pred_len, f_dim
                 e = e.mean(dim=1, keepdim=True)  # (B, 1)
             return e
 
-        e0 = err(backbone(x_in, cycle_index))
+        e0 = err(forward_fn(x_in))
         p_last = torch.full((B,), N - 1, dtype=torch.long)
         p_rand = torch.randint(0, max(N - 1, 1), (B,), generator=generator)
         patches = torch.stack([p_last, p_rand], dim=1).to(x_in.device)  # (B, 2)
@@ -72,7 +85,7 @@ def hindsight_targets(backbone, x_in, cycle_index, y, repair, P, pred_len, f_dim
         for j in range(2):
             sel = (point_patch.view(1, L) == patches[:, j].view(B, 1)).unsqueeze(-1)  # (B, L, 1)
             x_rep = torch.where(sel, repair, x_in)
-            e1s.append(err(backbone(x_rep, cycle_index)))
+            e1s.append(err(forward_fn(x_rep)))
         e1 = torch.stack(e1s, dim=1)  # (B, 2, C' or 1)
         e0 = e0.unsqueeze(1).expand_as(e1)
         h = (e1 < 0.98 * e0).float()
@@ -97,18 +110,24 @@ def hindsight_loss(alpha, targets, P, f_dim=0):
     return (w * bce).mean()
 
 
-def radar_loss(y_hat, y, aux, x_clean, pert_mask, rec_mask_pts=None, hind=None, cfg=None):
+def radar_loss(y_hat, y, aux, x_clean, pert_mask, rec_mask_pts=None, hind=None, cfg=None, stage='joint'):
+    """stage='joint': full loss; stage='B': MSE + λ_hind·L_hind only (stage-A modules frozen)."""
     lam_det = getattr(cfg, 'lam_det', 0.5)
     lam_rec = getattr(cfg, 'lam_rec', 0.5)
-    lam_hind = getattr(cfg, 'lam_hind', 0.1)
+    lam_hind = getattr(cfg, 'lam_hind', 0.5)
     lam_alpha = getattr(cfg, 'lam_alpha', 0.01)
-    pos_weight = getattr(cfg, 'pos_weight', 10.0)
+    pos_weight = getattr(cfg, 'pos_weight', 1.0)
+    neg_weight = getattr(cfg, 'pu_neg_weight', 0.1)
     u_clip = getattr(cfg, 'u_clip', 10.0)
 
     mse = F.mse_loss(y_hat, y)
-    l_det = det_loss(aux['logit'], pert_mask, pos_weight)
+    if stage == 'B':
+        l_hind = hind if hind is not None else torch.zeros((), device=y_hat.device)
+        total = mse + lam_hind * l_hind
+        return total, dict(mse=mse.item(), det=0.0, rec=0.0, hind=float(l_hind), alpha=aux['alpha'].mean().item())
+    l_det = det_loss(aux['logit'], pert_mask, pos_weight, neg_weight)
     select = pert_mask if rec_mask_pts is None else (pert_mask | rec_mask_pts)
-    l_rec = rec_loss(aux['u_hat'], x_clean, select, u_clip)
+    l_rec = rec_loss(aux['u_hat'], x_clean, select, u_clip, aux['m'], aux['s'])
     l_hind = hind if hind is not None else torch.zeros((), device=y_hat.device)
     l_alpha = aux['alpha'].mean()
     total = mse + lam_det * l_det + lam_rec * l_rec + lam_hind * l_hind + lam_alpha * l_alpha

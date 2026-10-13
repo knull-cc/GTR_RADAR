@@ -12,23 +12,28 @@ import torch.nn as nn
 # --------------------------------------------------------------------------------------
 # Robust scaling
 # --------------------------------------------------------------------------------------
-def robust_stats(x, eps=1e-5):
-    """Per-sample, per-channel median and 1.4826*MAD (+eps). x: (B, L, C) -> m, s: (B, 1, C)."""
+def robust_stats(x, eps=1e-5, std_frac=0.1, s_min=1e-2):
+    """Per-sample, per-channel median and a floored robust scale. x: (B, L, C) -> m, s: (B, 1, C).
+
+    s = max(1.4826*MAD, std_frac*std_window, s_min): the floor keeps u bounded on (near-)constant windows
+    (Weather rain channels, Solar nights) where MAD = 0.
+    """
     m = x.median(dim=1, keepdim=True).values
     mad = (x - m).abs().median(dim=1, keepdim=True).values
-    s = 1.4826 * mad + eps
+    sd = x.std(dim=1, keepdim=True, unbiased=False)
+    s = torch.maximum(1.4826 * mad, std_frac * sd).clamp_min(s_min)
     return m, s
 
 
 class RobustScaler(nn.Module):
-    """u = (x - median) / (1.4826 * MAD + 1e-5), statistics over the time axis of each sample/channel."""
+    """u = (x - median) / max(1.4826*MAD, 0.1*std, 1e-2), statistics over the time axis of each sample/channel."""
 
-    def __init__(self, eps=1e-5):
+    def __init__(self, std_frac=0.1, s_min=1e-2):
         super().__init__()
-        self.eps = eps
+        self.std_frac, self.s_min = std_frac, s_min
 
     def forward(self, x):
-        m, s = robust_stats(x, self.eps)
+        m, s = robust_stats(x, std_frac=self.std_frac, s_min=self.s_min)
         return (x - m) / s, m, s
 
     @staticmethod
@@ -166,6 +171,63 @@ class LocalMedianExpert(nn.Module):
         win = torch.cat([nan, x, nan], dim=1).unfold(1, 2 * h + 1, 1)  # (B, L, C, 2h+1)
         nb = torch.cat([win[..., :h], win[..., h + 1:]], dim=-1)
         return torch.nanmedian(nb, dim=-1).values
+
+
+class ReliableNeighborExpert(nn.Module):
+    """E2: median of the nearest *reliable* neighbours (R > thr; up to k before and k after t).
+
+    Unlike a plain local median it keeps working under contiguous corruption (e.g. the last 4/8 points zeroed):
+    corrupted neighbours are skipped. When no reliable point exists after t (end of the window), it falls back to
+    the level of the last k reliable points plus their least-squares linear trend, extrapolated to t.
+    Windows without any reliable point fall back to the window median. Parameter-free; R is detached.
+    """
+
+    def __init__(self, k=3, thr=0.5, trend=True):
+        super().__init__()
+        self.k, self.thr, self.trend = int(k), float(thr), bool(trend)
+
+    def forward(self, x, R):  # x, R: (B, L, C) -> (B, L, C)
+        B, L, C = x.shape
+        K = self.k
+        z = x.permute(0, 2, 1).reshape(B * C, L)
+        M = (R.detach() > self.thr).permute(0, 2, 1).reshape(B * C, L)
+        BC = z.shape[0]
+        ar = torch.arange(L, device=x.device)
+        order = torch.where(M, ar, ar + L).argsort(dim=1)  # reliable positions first, in time order
+        n_rel = M.sum(dim=1, keepdim=True)  # (BC, 1)
+        cs = M.long().cumsum(dim=1)  # reliable count in [0, t]
+        before = cs - M.long()  # reliable count in [0, t)
+        ks = torch.arange(1, K + 1, device=x.device)
+
+        rb = before.unsqueeze(-1) - ks  # rank of the k-th reliable point before t
+        vb = rb >= 0
+        pb = torch.gather(order, 1, rb.clamp_min(0).reshape(BC, -1)).reshape(BC, L, K)
+        xb = torch.gather(z, 1, pb.reshape(BC, -1)).reshape(BC, L, K)
+        rf = cs.unsqueeze(-1) + ks - 1  # rank of the k-th reliable point after t
+        vf = rf < n_rel.unsqueeze(-1)
+        pf = torch.gather(order, 1, rf.clamp_max(L - 1).reshape(BC, -1)).reshape(BC, L, K)
+        xf = torch.gather(z, 1, pf.reshape(BC, -1)).reshape(BC, L, K)
+
+        nan = torch.full_like(xb, float('nan'))
+        both = torch.nanmedian(torch.cat([torch.where(vb, xb, nan), torch.where(vf, xf, nan)], dim=-1), dim=-1).values
+        level_b = torch.nanmedian(torch.where(vb, xb, nan), dim=-1).values
+        end_val = level_b
+        if self.trend:
+            w = vb.to(z.dtype)
+            n = w.sum(-1)
+            tb = pb.to(z.dtype)
+            tm = (w * tb).sum(-1) / n.clamp_min(1.0)
+            xm = (w * xb).sum(-1) / n.clamp_min(1.0)
+            var = (w * (tb - tm.unsqueeze(-1)) ** 2).sum(-1)
+            cov = (w * (tb - tm.unsqueeze(-1)) * (xb - xm.unsqueeze(-1))).sum(-1)
+            slope = torch.where(n >= 2, cov / var.clamp_min(1e-6), torch.zeros_like(cov))
+            end_val = level_b + slope * (ar.to(z.dtype).view(1, L) - tm)
+
+        has_f, has_b = vf[..., 0], vb[..., 0]
+        fallback = z.median(dim=1, keepdim=True).values.expand(BC, L)
+        out = torch.where(has_f, both, torch.where(has_b, end_val, fallback))
+        out = torch.where(torch.isfinite(out), out, fallback)
+        return out.reshape(B, C, L).permute(0, 2, 1)
 
 
 def gtr_gather_index(cycle_index, seq_len, cycle_len):

@@ -137,7 +137,7 @@ def summarize(results_dir='./results_radar/', conditions=TEST_CONDITIONS, print_
                 row[f'mean_alpha_{cond}'] = avg(lambda r: r['extras'][cond]['mean_alpha'])
                 row[f'frac_alpha_gt_0.5_{cond}'] = avg(lambda r: r['extras'][cond]['frac_alpha_gt_0_5'])
                 row[f'alpha_last_point_{cond}'] = avg(lambda r: r['extras'][cond]['mean_alpha_last_point'])
-                for k, name in enumerate(('repairer', 'localmedian', 'cycleprior')):
+                for k, name in enumerate(('repairer', 'neighbor')):
                     row[f'pi_{name}_{cond}'] = avg(lambda r: r['extras'][cond]['mean_pi'][k])
             row['T1_last_point_auroc'] = avg(lambda r: r['extras']['T1_last_point_auroc'])
             row['tau'] = avg(lambda r: r['extras']['tau'])
@@ -226,11 +226,11 @@ def summarize(results_dir='./results_radar/', conditions=TEST_CONDITIONS, print_
         rows.append([r['dataset'], str(r['pred_len']), METHOD_LABEL[r['method']], f3('mean_alpha_clean'),
                      f3('mean_alpha_T1_raw'), f3('frac_alpha_gt_0.5_clean'), f3('frac_alpha_gt_0.5_T1_raw'),
                      f3('alpha_last_point_T1_raw'), f3('T1_last_point_auroc'),
-                     '/'.join(f3(f'pi_{n}_clean') for n in ('repairer', 'localmedian', 'cycleprior')),
-                     '/'.join(f3(f'pi_{n}_T1_raw') for n in ('repairer', 'localmedian', 'cycleprior')),
+                     '/'.join(f3(f'pi_{n}_clean') for n in ('repairer', 'neighbor')),
+                     '/'.join(f3(f'pi_{n}_T1_raw') for n in ('repairer', 'neighbor')),
                      f3('time_ratio_vs_B0'), r.get('mean_dbar_per_patch_clean', '')])
     if rows:
-        md.append('### RADAR diagnostics (mean over seeds; π = Repairer/LocalMedian/CyclePrior)')
+        md.append('### RADAR diagnostics (mean over seeds; π = Repairer/ReliableNeighbor)')
         table(['Dataset', 'H', 'Method', 'ᾱ clean', 'ᾱ T1', 'α>0.5 clean', 'α>0.5 T1', 'α last pt T1',
                'AUROC T1 last', 'π clean', 'π T1', 'time ×B0', 'mean d̄ per patch (oldest→newest)'], rows)
 

@@ -75,7 +75,10 @@ def setting_name(args):
 def ckpt_paths(args):
     d = os.path.join(args.radar_ckpt_dir, setting_name(args))
     os.makedirs(d, exist_ok=True)
-    return {k: os.path.join(d, f'{k}.pth') for k in ('base', 'aug', 'pre', 'radar', 'plugin')}
+    # RADAR v2 architecture (PU detection, reliable-neighbour expert, log-linear gate, staged training) uses new
+    # file names, so v1 checkpoints are never loaded by mistake; base/aug (pure GTR) are shared.
+    names = dict(base='base', aug='aug', pre='pre_v2', radar='radar_v2', plugin='plugin_v2')
+    return {k: os.path.join(d, f'{v}.pth') for k, v in names.items()}
 
 
 def _sync(device):
@@ -140,10 +143,13 @@ class Exp_Radar(Exp_Main):
             return model(x, cycle, **kw)
         raise ValueError(f'Exp_Radar only supports GTR-family backbones, got {self.args.model}')
 
-    def _train_mode(self, freeze_backbone=False):
+    def _train_mode(self, freeze_backbone=False, freeze_stage_a=False):
         self.model.train()
         if freeze_backbone and self.use_radar:
             self.model.backbone.eval()
+        if freeze_stage_a and self.use_radar:
+            self.model.reliability.eval()
+            self.model.repairer.eval()
 
     def _set_probe_seed(self, model, seed):
         if isinstance(model, RADARWrapper):
@@ -296,8 +302,9 @@ class Exp_Radar(Exp_Main):
                 x_p, _, c = self._to_dev(x_p, by, bc)
                 W.repair(x_p, c, compute_dep=False)
                 aux = W.last_aux
-                l_det = det_loss(aux['logit'], mask.to(self.device), self.args.pos_weight)
-                l_rec = rec_loss(aux['u_hat'], x_clean.to(self.device), mask.to(self.device), self.args.u_clip)
+                l_det = det_loss(aux['logit'], mask.to(self.device), self.args.pos_weight, self.args.pu_neg_weight)
+                l_rec = rec_loss(aux['u_hat'], x_clean.to(self.device), mask.to(self.device), self.args.u_clip,
+                                 aux['m'], aux['s'])
                 tot += (l_det + l_rec).item()
                 nb += 1
         return tot / max(nb, 1)
@@ -313,7 +320,7 @@ class Exp_Radar(Exp_Main):
         rz = self.raw_zero()
         perturber = MixturePerturber(rz, args.p_perturb, seed=args.random_seed + 202)
         val_pert = MixturePerturber(rz, args.p_perturb, seed=args.val_seed)
-        opt = optim.Adam(W.radar_parameters(), lr=args.radar_lr)
+        opt = optim.Adam(W.stage_a_parameters(), lr=args.radar_lr)  # stage A: ReliabilityNet + Repairer
         best = float('inf')
         for epoch in range(args.pre_epochs):
             self._train_mode(freeze_backbone=True)
@@ -328,9 +335,9 @@ class Exp_Radar(Exp_Main):
                 opt.zero_grad()
                 W.repair(x_p, c, rec_mask=rec_mask, compute_dep=False)
                 aux = W.last_aux
-                l_det = det_loss(aux['logit'], mask, args.pos_weight)
+                l_det = det_loss(aux['logit'], mask, args.pos_weight, args.pu_neg_weight)
                 sel = mask | patch_mask_to_points(rec_mask, B, C, L, W.P)
-                l_rec = rec_loss(aux['u_hat'], x_clean, sel, args.u_clip)
+                l_rec = rec_loss(aux['u_hat'], x_clean, sel, args.u_clip, aux['m'], aux['s'])
                 loss = l_det + l_rec
                 loss.backward()
                 opt.step()
@@ -359,10 +366,15 @@ class Exp_Radar(Exp_Main):
         W.backbone.load_state_dict(torch.load(base_ckpt, map_location=self.device))
         for p in W.backbone.parameters():
             p.requires_grad_(not freeze_backbone)
+        # plug-in = stage B: backbone AND stage-A modules frozen; only Router + gate (a, b, τ) are trained
+        stage_b = freeze_backbone and getattr(args, 'plugin_train', 'gate') == 'gate'
+        for p in W.stage_a_parameters():
+            p.requires_grad_(not stage_b)
 
         radar_lr = args.radar_lr
         bb_lr = args.bb_lr_scale * args.learning_rate
-        groups = [{'params': W.radar_parameters(), 'lr': radar_lr, 'lr0': radar_lr}]
+        trainable = W.gate_parameters() if stage_b else W.radar_parameters()
+        groups = [{'params': trainable, 'lr': radar_lr, 'lr0': radar_lr}]
         if not freeze_backbone:
             groups.append({'params': list(W.backbone.parameters()), 'lr': bb_lr, 'lr0': bb_lr})
         opt = optim.Adam(groups)
@@ -379,7 +391,7 @@ class Exp_Radar(Exp_Main):
         s, cl, pe = self.val_score(W, val_pert)
         print(f'[{tag}] start: val_score {s:.6f} (clean {cl:.6f}, perturbed {pe:.6f})')
         for epoch in range(args.ft_epochs):
-            self._train_mode(freeze_backbone)
+            self._train_mode(freeze_backbone, freeze_stage_a=stage_b)
             t0, logs = time.time(), []
             for bx, by, _, _, bc in train_loader:
                 x_clean = bx.float()
@@ -387,7 +399,7 @@ class Exp_Radar(Exp_Main):
                 x_p, y, c = self._to_dev(x_p, by, bc)
                 x_clean, mask = x_clean.to(self.device), mask.to(self.device)
                 B, L, C = x_p.shape
-                rec_mask = self._rand_patch_mask(B * C, W.N)
+                rec_mask = None if stage_b else self._rand_patch_mask(B * C, W.N)
                 opt.zero_grad()
                 y_hat = W(x_p, c, rec_mask=rec_mask)[:, -args.pred_len:, self.f_dim:]
                 aux = W.last_aux
@@ -397,8 +409,9 @@ class Exp_Radar(Exp_Main):
                     tg = hindsight_targets(W.backbone, x_p, c, y, aux['target'].detach(), W.P, args.pred_len,
                                            self.f_dim, args.hind_level, hind_gen)
                     hind = hindsight_loss(aux['alpha'], tg, W.P, self.f_dim)
-                rec_pts = patch_mask_to_points(rec_mask, B, C, L, W.P)
-                total, parts = radar_loss(y_hat, y, aux, x_clean, mask, rec_pts, hind, args)
+                rec_pts = None if rec_mask is None else patch_mask_to_points(rec_mask, B, C, L, W.P)
+                total, parts = radar_loss(y_hat, y, aux, x_clean, mask, rec_pts, hind, args,
+                                          stage='B' if stage_b else 'joint')
                 total.backward()
                 opt.step()
                 logs.append([parts[k] for k in ('mse', 'det', 'rec', 'hind', 'alpha')])
@@ -413,7 +426,7 @@ class Exp_Radar(Exp_Main):
                 break
             self._type3(opt, epoch + 1)
         W.load_state_dict(torch.load(out_ckpt, map_location=self.device))
-        for p in W.backbone.parameters():
+        for p in W.parameters():
             p.requires_grad_(True)
 
     # ------------------------------------------------------------------ evaluation
@@ -443,7 +456,7 @@ class Exp_Radar(Exp_Main):
             n, nb, t_model = 0, 0, 0.0
             acc = None
             if collect_extras and cond in ('clean', 'T1_raw'):
-                K = 3
+                K = int(getattr(model, 'n_experts', 3))
                 acc = dict(a_sum=0.0, a_gt=0.0, a_last=0.0, n_pts=0, n_last=0, pi=np.zeros(K), pi_aw=np.zeros(K),
                            a_tot=0.0, dbar=None, n_bc=0)
             with torch.no_grad():
@@ -505,7 +518,7 @@ class Exp_Radar(Exp_Main):
             ex['T1_auroc_n_pos'] = int(l_all.sum())
             ex['T1_auroc_n_neg'] = int(len(l_all) - l_all.sum())
             ex['tau'] = float(model.tau.item())
-            ex['experts'] = ['Repairer', 'LocalMedian', 'CyclePrior']
+            ex['experts'] = list(getattr(model, 'expert_names', ('Repairer', 'LocalMedian', 'CyclePrior')))
             ex['cycle_prior_enabled'] = bool(model.use_cycle_prior)
         if isinstance(model, RADARWrapper):
             model.probe_generator = None
