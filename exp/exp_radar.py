@@ -391,7 +391,7 @@ class Exp_Radar(Exp_Main):
         stopper = EarlyStopper(args.ft_patience, out_ckpt)
         tag = 'S3-plugin' if freeze_backbone else 'S3'
 
-        if stage_b and args.tau_calib_frac > 0:
+        if freeze_backbone and args.tau_calib_frac > 0:  # plug-in (gate-only or all RADAR modules)
             self._calibrate_gate(W, train_loader)
         torch.manual_seed(args.random_seed + 7)  # same CPU RNG stream as S1 -> identical batches/perturbations
         s, cl, pe = self.val_score(W, val_pert)
