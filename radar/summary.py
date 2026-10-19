@@ -7,8 +7,9 @@ Outputs (in results_dir):
                          Δ of Ours-plugin vs each baseline, RADAR diagnostics (AUROC, gate, repair error, π)
   summary_appendix.md    breakdown by length k and by channel ratio
   summary_router.md      Router coefficients (log-odds vs E1) and π at open gates by gap length
-Main methods: B0 GTR, B1 GTR+Aug, B2 GTR+Hampel, Ours-plugin; Ours (joint) / Ours-argmax / Ours-oracle (perfect gate,
-diagnostic) and earlier architectures (Ours-plugin-v5, ...) are listed separately.
+Main methods: B0 GTR, B1 GTR+Aug, B2 GTR+Hampel, Ours-plugin; Ours (joint) / Ours-uncal / Ours-argmax / Ours-oracle
+(perfect gate, diagnostic), earlier architectures (Ours-plugin-v5, ...) and switch variants (Ours-plugin_th,
+Ours-plugin_expe1e2e3, ...) are listed separately.
 """
 import csv
 import glob
@@ -21,13 +22,14 @@ import numpy as np
 from radar.perturb import OOD_TYPES, POS_LABEL, POSITIONS, TYPE_LABEL, TYPES, parse_condition
 
 MAIN_METHODS = ('B0', 'B1', 'B2', 'Ours-plugin')
-EXTRA_METHODS = ('Ours-argmax', 'Ours-oracle', 'Ours')
+EXTRA_METHODS = ('Ours-uncal', 'Ours-argmax', 'Ours-oracle', 'Ours')
 ALL_METHODS = MAIN_METHODS + EXTRA_METHODS
 BASELINES = ('B0', 'B1', 'B2')
 OURS = 'Ours-plugin'
-RADAR_METHODS = ('Ours-plugin', 'Ours-argmax', 'Ours-oracle', 'Ours')
+RADAR_METHODS = ('Ours-plugin', 'Ours-uncal', 'Ours-argmax', 'Ours-oracle', 'Ours')
 METHOD_LABEL = {'B0': 'B0 GTR', 'B1': 'B1 GTR+Aug', 'B2': 'B2 GTR+Hampel', 'Ours-plugin': 'Ours-plugin',
                 'Ours-argmax': 'Ours-plugin (argmax π)', 'Ours-oracle': 'Ours-plugin (oracle gate)',
+                'Ours-uncal': 'Ours-plugin (τ as trained, no recalibration)',
                 'Ours': 'Ours (joint)'}
 DATASET_ORDER = ['etth1', 'etth2', 'ettm1', 'ettm2', 'weather', 'electricity', 'traffic', 'solar']
 MAIN_GROUPS = [(t, p) for t in TYPES for p in POSITIONS]
@@ -204,9 +206,10 @@ def summarize(results_dir='./results_radar_v6/', print_tables=True, **_):
                    table_rows([OURS] + extra if OURS in methods else extra, main_groups + ood_groups, idx))
 
     if OURS in methods:
-        comps = [b for b in BASELINES if b in methods] + sorted(m for m in methods if m.startswith('Ours-plugin-v'))
-        md.append('### Δ MSE of Ours-plugin vs each baseline (and earlier architectures), (B − Ours) / B, '
-                  '+ = Ours better')
+        comps = [b for b in BASELINES if b in methods] + sorted(
+            m for m in methods if m != OURS and (m.startswith('Ours-plugin') or m.startswith('Ours-uncal')))
+        md.append('### Δ MSE of Ours-plugin vs each baseline (and earlier architectures / variants), (B − Ours) / B, '
+                  '+ = Ours-plugin better, − = the other row better')
         rows = []
         for ds, H in dsh:
             for b in comps:

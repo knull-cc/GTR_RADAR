@@ -8,6 +8,7 @@
 #   MODE=revin       step 1: S0 (reused if base.pth exists) + RevIN 2×2 diagnostic on B0   (diag_v4.py revin)
 #   MODE=experts     step 2: offline expert repair errors (+ E1 if pre_<arch>.pth exists)   (diag_v4.py experts)
 #   MODE=det         step 3: S0 + S2 + detector AUROC per condition                         (diag_v4.py det)
+#   MODE=timing      inference time of the trained plug-in per module vs B0                (diag_v4.py timing)
 #                    DET_FEATS=v3 evaluates the v3-feature detector (separate checkpoint pre_<arch>_detv3.pth)
 #   MODE=eval        evaluation only (checkpoints must exist); METHODS="B0,B1,B2,Ours-plugin" by default.
 #                    e.g. ARCH=v5 METHODS=Ours-plugin MODE=eval adds the v5 plug-in as Ours-plugin-v5
@@ -101,7 +102,7 @@ run_one() {
   $PY -u run_radar.py eval           "${common[@]}" --methods "$methods" 2>&1 | tee "${log}__eval.log"
 }
 
-run_step_one() {  # MODE = revin | experts | det
+run_step_one() {  # MODE = revin | experts | det | timing
   _setup "$1" "$2" 1
   echo "================ [$MODE] $setting ================"
   $PY -u run_radar.py train_base "${common[@]}" 2>&1 | tee "${log}__S0.log"
@@ -131,7 +132,7 @@ run_diag_one() {
 run_all() {
   check_data
   case "$MODE" in
-    revin|experts|det)
+    revin|experts|det|timing)
       for pred_len in $PRED_LENS; do for seed in $SEEDS; do run_step_one "$pred_len" "$seed"; done; done
       return ;;
     diag)
@@ -142,7 +143,7 @@ run_all() {
       $PY -u run_radar.py summarize --results_dir "$RESULTS_DIR" 2>&1 | tee "$LOG_DIR/summary_${model_id_name}.log"
       return ;;
     full) ;;
-    *) echo "unknown MODE=$MODE (full | revin | experts | det | eval | diag)"; exit 1 ;;
+    *) echo "unknown MODE=$MODE (full | revin | experts | det | timing | eval | diag)"; exit 1 ;;
   esac
   for pred_len in $PRED_LENS; do
     for seed in $SEEDS; do

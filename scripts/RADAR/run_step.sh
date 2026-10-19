@@ -4,9 +4,10 @@
 #   bash scripts/RADAR/run_step.sh experts ETTh1                   # step 2: offline expert repair errors
 #   bash scripts/RADAR/run_step.sh det     ETTh1                   # step 3: S2 + detector AUROC (v4 features)
 #   DET_FEATS=v3 bash scripts/RADAR/run_step.sh det ETTh1          #         the same with the v3 features
+#   bash scripts/RADAR/run_step.sh timing  ETTh1                   # plug-in inference time per module
 # Results: results_radar_v6/diag/<setting>__<step>.md / .json
 set -eo pipefail
-step=${1:?usage: run_step.sh revin|experts|det DATASET...}
+step=${1:?usage: run_step.sh revin|experts|det|timing DATASET...}
 shift
 dir="$(dirname "$0")"
 list="${*:-etth1}"

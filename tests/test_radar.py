@@ -699,3 +699,93 @@ def test_v6_gate_calibration_window_budget():
     assert frac_w <= 0.05 + 1.0 / zw.numel() + 1e-6 and W.seg_delta.item() >= 0
     tau_pt = W.tau_raw.item() - W.seg_delta.item()
     assert abs((zs > tau_pt).float().mean().item() - 0.01) < 0.01
+
+
+# v6 follow-ups: tail-segment hypothesis, exact second-pass skip, timers, variant naming ---------------------------
+def test_tail_hypothesis_shapes_gradients_and_checkpoint():
+    W, bb, cfg = make_wrapper(arch='v6', tail_hyp=1)
+    assert W.tail_hyp and {'th_k', 'th_b', 'th_h'} <= set(W.state_dict())
+    assert len(W.gate_scalars()) == 7  # a, b, g, k, β, h, τ
+    x, ci = make_batch()
+    x_p = x.clone()
+    x_p[:, -6:, :3] += 3.0
+    mask = (x_p - x).abs() > 1e-6
+    y = torch.randn(B, H, C)
+    y_hat = W(x_p, ci)
+    aux = W.last_aux
+    assert aux['tail_E'].shape == (B, C) and aux['tail_w'].shape == (B, C) and aux['tail_mask'].shape == (B, L, C)
+    assert torch.isfinite(aux['tail_E']).all() and (aux['tail_E'] >= 0).all()
+    assert (aux['tail_mask'][:, : L - 16] == 0).all() and (aux['tail_mask'][:, -1] == 1).all()
+    total, _ = radar_loss(y_hat, y, aux, x, mask, None, None, cfg)
+    total.backward()
+    for p in (W.th_k, W.th_b, W.th_h):
+        assert p.grad is not None and torch.isfinite(p.grad).all()
+    # S2 (need_route=False) does not use the hypothesis
+    W.repair(x_p, ci, need_route=False)
+    assert 'tail_E' not in W.last_aux
+
+
+def test_tail_hypothesis_evidence_separates_a_shifted_tail():
+    W, _, _ = make_wrapper(arch='v6', tail_hyp=1)
+    t = torch.arange(L, dtype=torch.float32)
+    sig = torch.stack([torch.sin(2 * math.pi * t / 24 + k) + 0.01 * t for k in range(C)], dim=-1).unsqueeze(0)
+    x = sig.repeat(2, 1, 1)
+    x[1, -8:, :] += 3.0  # window 1: shifted tail, inner points locally normal
+    logit = torch.full_like(x, -5.0)
+    logit[:, L - 8, :] = 2.0  # strongest alarm at the jump
+    _, s = robust_stats(x)
+    with torch.no_grad():
+        E, seg, w = W._tail_hypothesis(x, logit, torch.ones_like(x), s)
+    assert (seg[:, L - 8:] == 1).all() and (seg[:, :L - 8] == 0).all()
+    assert (E[1] > E[0] + 0.5).all() and (w[1] > w[0]).all()
+
+
+def test_second_backbone_pass_only_for_changed_windows_is_exact():
+    W, bb, _ = make_wrapper(arch='v6', dep_mode='none')  # no Hutchinson probes through the backbone
+    x, ci = make_batch()
+    mask = torch.zeros_like(x, dtype=torch.bool)
+    mask[0, -4:, :2] = True  # only window 0 is repaired
+    W.oracle_gate, W.oracle_mask = True, mask
+    calls = []
+    orig = W.backbone.forward
+
+    def spy(z, c):
+        calls.append(z.shape[0])
+        return orig(z, c)
+
+    W.backbone.forward = spy
+    with torch.no_grad():
+        out = W(x, ci)
+        aux = W.last_aux
+        W.backbone.forward = orig
+        ref = torch.where(mask.any(dim=1, keepdim=True), bb(aux['x_tilde'], ci), bb(x, ci))
+    assert calls == [B + 1]  # x for all windows + x̃ for the one changed window
+    assert torch.allclose(out, ref, atol=1e-5)
+    W.oracle_mask = torch.zeros_like(mask)
+    calls.clear()
+    W.backbone.forward = spy
+    with torch.no_grad():
+        out = W(x, ci)
+    W.backbone.forward = orig
+    assert calls == [B] and torch.allclose(out, bb(x, ci), atol=1e-5)
+
+
+def test_section_timers_and_variant_names():
+    from exp.exp_radar import ckpt_suffix
+    W, _, cfg = make_wrapper(arch='v6', tail_hyp=1)
+    x, ci = make_batch()
+    W.timer = {}
+    with torch.no_grad():
+        W(x, ci)
+    keys = set(W.timer)
+    assert {'detector', 'stage1/E3', 'stage1/E4', 'stage1/loo_prior', 'E1', 'gate', 'backbone', 'tail_hyp'} <= keys
+    assert any(k.startswith('tail_hyp/') for k in keys) and all(v >= 0 for v in W.timer.values())
+    W.timer = None
+    a = types.SimpleNamespace(arch='v6', experts='auto', tail_hyp=1, tail_hyp_len=16, ckpt_tag='')
+    assert ckpt_suffix(a, 'plugin') == '_th' and ckpt_suffix(a, 'pre') == ''
+    a.experts = 'e1,e2,e3'
+    assert ckpt_suffix(a, 'pre') == '_expe1e2e3' and ckpt_suffix(a, 'plugin') == '_expe1e2e3_th'
+    W2, _, _ = make_wrapper(arch='v6', experts='e1,e2,e3')
+    with torch.no_grad():
+        W2(x, ci)
+    assert (W2.last_aux['pi'][..., 2] == 0).all()

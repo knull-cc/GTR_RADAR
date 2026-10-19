@@ -27,7 +27,7 @@ from radar.losses import (det_loss, hindsight_loss, hindsight_targets, patch_mas
                           rec_loss, route_loss)
 from radar.modules import LENGTH_BINS, hampel_filter, length_bin, robust_stats
 from radar.perturb import TEST_CONDITIONS, MixturePerturber, apply_condition, condition_rng, raw_zero_from_scaler
-from radar.radar import RADARWrapper, resolve_experts
+from radar.radar import RADARWrapper, resolve_experts, resolve_tau_recal
 from utils.tools import adjust_learning_rate
 
 METHODS = ('B0', 'B1', 'B2', 'Ours-plugin')  # main protocol; 'Ours' (joint) and 'Ours-argmax' (hard routing) optional
@@ -99,6 +99,8 @@ def ckpt_suffix(args, stage):
             v = int(getattr(args, key, -1))
             if v >= 0 and bool(v) != default:
                 parts.append(f'{tag}{v}')
+        if int(getattr(args, 'tail_hyp', 0)) and arch in ('v5', 'v6'):
+            parts.append('th' + ('' if int(getattr(args, 'tail_hyp_len', 16)) == 16 else str(args.tail_hyp_len)))
         if stage == 'plugin' and getattr(args, 'plugin_train', 'all') != 'all':
             parts.append(f'p{args.plugin_train}')
     if getattr(args, 'ckpt_tag', ''):
@@ -520,7 +522,7 @@ class Exp_Radar(Exp_Main):
         for p in W.parameters():
             p.requires_grad_(True)
 
-    def _calibrate_gate(self, W, train_loader):
+    def _calibrate_gate(self, W, train_loader, update_dep=True, tag='S3-plugin'):
         """Stage-B initialisation on CLEAN training windows (no val/test data):
         1) fill the backbone's EMA dependency profile; 2) set τ so that only `tau_calib_frac` of clean points
         have α > 0.5 (i.e. τ = (1 − frac)-quantile of the gate logit without τ).
@@ -531,12 +533,22 @@ class Exp_Radar(Exp_Main):
         nb = max(1, int(args.tau_calib_batches))
         W.eval()
         batches = []
+        if isinstance(train_loader, (list, tuple)):
+            pick = None
+        else:  # evenly spaced batches of an ordered loader; the first nb batches of a shuffled one
+            n = len(train_loader)
+            pick = set(np.linspace(0, n - 1, min(nb, n)).round().astype(int).tolist()) if not update_dep else None
         for i, (bx, by, _, _, bc) in enumerate(train_loader):
-            if i >= nb:
+            if pick is None and len(batches) >= nb:
                 break
+            if pick is not None and i > max(pick):
+                break
+            if pick is not None and i not in pick:
+                continue
             x, _, c = self._to_dev(bx, by, bc)
             batches.append((x, c))
-            W.calibrate_dependency(x, c)
+            if update_dep:
+                W.calibrate_dependency(x, c)
         zs, zw = [], []
         for x, c in batches:
             z = W.gate_logit_without_tau(x, c)  # point-level gate logit without τ, (B, L, C)
@@ -564,7 +576,7 @@ class Exp_Radar(Exp_Main):
         else:
             tau = tau_pt
         W.tau_raw.data.fill_(tau)
-        print(f'[S3-plugin] calibrated on {len(batches)} clean train batches: {msg}')
+        print(f'[{tag}] calibrated on {len(batches)} clean train batches: {msg}')
 
     # ------------------------------------------------------------------ evaluation
     def condition_loader(self, split='test'):
@@ -650,6 +662,9 @@ class Exp_Radar(Exp_Main):
             ex['seg_gate'] = bool(model.seg_gate)
             ex['fc_mix'] = bool(model.fc_mix)
             ex['oracle_gate'] = bool(model.oracle_gate)
+            ex['tail_hyp'] = bool(model.tail_hyp)
+            if hasattr(model, 'tau_trained'):
+                ex['tau_trained'] = model.tau_trained
             ex['e3_period'] = int(model.e3_period)
             ex['e3_enabled'] = bool(model.periodic.enabled and bool(model.expert_enabled[2]))
             ex['det_feats'] = model.det_feats
@@ -665,12 +680,13 @@ class Exp_Radar(Exp_Main):
         return lambda x: hampel_filter(x, a.hampel_window, a.hampel_k, a.hampel_mad_scale)
 
     METHOD_CKPT = {'B0': 'base', 'B1': 'aug', 'B2': 'base', 'Ours': 'radar', 'Ours-plugin': 'plugin',
-                   'Ours-argmax': 'plugin', 'Ours-oracle': 'plugin'}
+                   'Ours-argmax': 'plugin', 'Ours-oracle': 'plugin', 'Ours-uncal': 'plugin'}
 
     def load_method(self, method, paths):
         """Returns (model, preprocess) for a method, or (None, None) if its checkpoint is missing.
         'Ours-argmax' = the plug-in checkpoint evaluated with hard (argmax) routing; 'Ours-oracle' = the plug-in
-        with a perfect gate (α = 1 exactly on the corrupted points; diagnostic upper bound of the gate)."""
+        with a perfect gate (α = 1 exactly on the corrupted points; diagnostic upper bound of the gate);
+        'Ours-uncal' = the plug-in with τ as trained (no post-training recalibration; v6 recalibrates by default)."""
         need = self.METHOD_CKPT[method]
         if not os.path.exists(paths[need]):
             return None, None
@@ -684,6 +700,14 @@ class Exp_Radar(Exp_Main):
             m.route_hard = True
         if method == 'Ours-oracle':
             m.oracle_gate = True
+        if (method in ('Ours', 'Ours-plugin', 'Ours-argmax') and resolve_tau_recal(self.args)
+                and float(self.args.tau_calib_frac) > 0):
+            # post-training recalibration of τ (and δ) on clean training windows: S3 keeps training the detector and
+            # the gate after the initial calibration, so the false-repair budget drifts; the dependency profile is
+            # left as trained
+            tau0 = float(m.tau_raw)
+            self._calibrate_gate(m, self.ordered_loader('train')[1], update_dep=False, tag=f'eval {method}')
+            m.tau_trained = tau0
         m.eval()
         return m, (self.hampel() if method == 'B2' else None)
 
@@ -700,7 +724,13 @@ class Exp_Radar(Exp_Main):
                 continue
             # RADAR methods of a non-default architecture are recorded as e.g. 'Ours-plugin-v4', so they can sit next
             # to the default architecture in the same results directory
-            name = method if method in ('B0', 'B1', 'B2') or args.arch == 'v6' else f'{method}-{args.arch}'
+            name = method
+            if method not in ('B0', 'B1', 'B2'):
+                if args.arch != 'v6':
+                    name = f'{name}-{args.arch}'
+                sfx = ckpt_suffix(args, 'radar' if method == 'Ours' else 'plugin')
+                if sfx:  # ablation / variant checkpoints get their own row, e.g. 'Ours-plugin_th'
+                    name += sfx
             print(f'[eval] {name} ({setting})')
             res = self.test(model=model, preprocess=pre, conditions=tuple(conditions))
             res.update(dict(kind='eval', version='v4', arch=args.arch, method=name, setting=setting,

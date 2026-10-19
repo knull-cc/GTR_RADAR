@@ -22,7 +22,9 @@ v4 (`--arch v4`): E1 is a third competing expert, π = softmax(wᵀφ) over {E1,
 The Router (w) only ever receives forecast-loss gradients: the forecast MSE through c_base and L_route. The
 reconstruction loss sees u_base detached, and the gate sees c detached.
 """
+import contextlib
 import math
+import time
 
 import torch
 import torch.nn as nn
@@ -69,12 +71,40 @@ def resolve_gate_consistency(cfg):
     return _auto_flag(cfg, 'gate_consistency', str(_cfg(cfg, 'arch', 'v6')) in ('v5', 'v6'))
 
 
+def resolve_tau_recal(cfg):
+    """--tau_recal: post-training recalibration of τ at evaluation; 1 / 0, or -1 (default) = on for v6 only."""
+    return _auto_flag(cfg, 'tau_recal', str(_cfg(cfg, 'arch', 'v6')) == 'v6')
+
+
 def resolve_experts(cfg):
     """--experts: comma list, or 'auto' (default) = e1,e2,e3,e4 for v6 and e1,e2,e3 otherwise."""
     e = str(_cfg(cfg, 'experts', 'auto')).strip().lower()
     if e in ('', 'auto'):
         e = 'e1,e2,e3,e4' if str(_cfg(cfg, 'arch', 'v6')) == 'v6' else 'e1,e2,e3'
     return [k.strip() for k in e.split(',') if k.strip()]
+
+
+class _Section:
+    """Wall-clock timer of one section (CUDA-synchronised), accumulated into a dict (timing diagnostic only)."""
+
+    def __init__(self, store, name, sync):
+        self.store, self.name, self.sync = store, name, sync
+
+    def __enter__(self):
+        if self.sync:
+            torch.cuda.synchronize()
+        self.t0 = time.perf_counter()
+
+    def __exit__(self, *exc):
+        if self.sync:
+            torch.cuda.synchronize()
+        self.store[self.name] = self.store.get(self.name, 0.0) + time.perf_counter() - self.t0
+        return False
+
+
+def masked_median(v, mask, dim=1):
+    """Median of v over the points where mask is True (along dim); NaN where the mask is empty."""
+    return torch.nanmedian(torch.where(mask, v, torch.full_like(v, float('nan'))), dim=dim).values
 
 
 def segment_max(z, inrun):
@@ -136,6 +166,7 @@ class RADARWrapper(nn.Module):
         if v5:
             assert 'e2' in keys, 'v5/v6 stage 1 needs E2: --experts must contain e2'
         self.register_buffer('expert_enabled', torch.tensor([k in keys for k in EXPERT_KEYS]), persistent=False)
+        self._e4_on = 'e4' in keys
         self.router_type = str(_cfg(cfg, 'router', 'linear'))
         assert self.router_type in ('linear', 'h'), self.router_type
         if v6:
@@ -177,6 +208,16 @@ class RADARWrapper(nn.Module):
             self.register_buffer('seg_delta', torch.tensor(2.0))
         self.oracle_gate = False  # evaluation diagnostic: α = 1 exactly on the corrupted points
         self.oracle_mask = None
+        # tail-segment hypothesis (v5 / v6): "everything from the strongest tail alarm to the end is corrupted" is
+        # tested against a stage-1 repair anchored before it; the evidence lowers R on that segment and enters the gate
+        self.tail_hyp = bool(int(_cfg(cfg, 'tail_hyp', 0))) and v5
+        self.tail_len = int(_cfg(cfg, 'tail_hyp_len', 16))
+        if self.tail_hyp:
+            self.th_k = nn.Parameter(torch.tensor(_inv_softplus(4.0)))  # slope of w = σ(sp(k)(E − β))
+            self.th_b = nn.Parameter(torch.tensor(1.5))                 # β: evidence level of w = 0.5
+            self.th_h = nn.Parameter(torch.tensor(_inv_softplus(1.0)))  # gate weight of the evidence
+        self.timer = None  # dict -> per-section wall-clock seconds (diag_v4.py timing)
+        self._tprefix = ''
 
         # ---- dependency
         self.dep_mode = str(_cfg(cfg, 'dep_mode', 'ema'))
@@ -203,7 +244,8 @@ class RADARWrapper(nn.Module):
 
     def gate_scalars(self):
         g = [self.gate_g] if self.gate_consistency else []
-        return [self.gate_a, self.gate_b] + g + [self.tau_raw]
+        th = [self.th_k, self.th_b, self.th_h] if self.tail_hyp else []
+        return [self.gate_a, self.gate_b] + g + th + [self.tau_raw]
 
     def gate_values(self):
         out = dict(a=float(F.softplus(self.gate_a)), b=float(F.softplus(self.gate_b)), tau=float(self.tau_raw),
@@ -212,7 +254,14 @@ class RADARWrapper(nn.Module):
             out['g'] = float(F.softplus(self.gate_g))
         if self.seg_gate:
             out['seg_delta'] = float(self.seg_delta)
+        if self.tail_hyp:
+            out.update(th_k=float(F.softplus(self.th_k)), th_b=float(self.th_b), th_h=float(F.softplus(self.th_h)))
         return out
+
+    def _sec(self, name):
+        if self.timer is None:
+            return contextlib.nullcontext()
+        return _Section(self.timer, self._tprefix + name, torch.cuda.is_available())
 
     def set_route_temp(self, value):
         self.route_temp.fill_(float(value))
@@ -296,9 +345,11 @@ class RADARWrapper(nn.Module):
 
     def _param_free(self, x, R):
         """E2 / E3 candidates and the reliable context for reliability R (detached)."""
-        ctx = reliable_context(to_series(R.detach()) > self.e2_thr, self.e2_k)
-        c2 = self.neighbor(x, ctx)
-        c3, a3, spread3 = self.periodic(x, ctx, fill=c2)
+        with self._sec('stage1/context+E2'):
+            ctx = reliable_context(to_series(R.detach()) > self.e2_thr, self.e2_k)
+            c2 = self.neighbor(x, ctx)
+        with self._sec('stage1/E3'):
+            c3, a3, spread3 = self.periodic(x, ctx, fill=c2)
         a3 = a3 & self.expert_enabled[2]
         c3 = torch.where(a3, c3, c2)
         return ctx, c2, c3, a3, spread3
@@ -317,20 +368,29 @@ class RADARWrapper(nn.Module):
         ctx, c2, c3, a3, spread3 = self._param_free(x, R)
         ones = torch.ones_like(a3)
         if self.arch == 'v6':
-            c4, a4, corr4 = self.cross(x, R.detach() > self.e2_thr, fill=c2)
-            a4 = a4 & self.expert_enabled[3]
-            c4 = torch.where(a4, c4, c2)
+            if self._e4_on:
+                with self._sec('stage1/E4'):
+                    c4, a4, corr4 = self.cross(x, R.detach() > self.e2_thr, fill=c2)
+                a4 = a4 & self.expert_enabled[3]
+                c4 = torch.where(a4, c4, c2)
+            else:  # E4 disabled (ablation): skip its computation entirely
+                c4, a4, corr4 = c2, torch.zeros_like(a3), x.new_zeros(x.shape[0], x.shape[2])
             cands, avails = [c2, c3, c4], [ones, a3, a4]
-            prior, ehat = loo_prior_multi(x, ctx, cands, avails, s)
-            phi = route_features_v6(ctx, R, c2, c3, c4, s, a3, a4, spread3, corr4)
+            with self._sec('stage1/loo_prior'):
+                prior, ehat = loo_prior_multi(x, ctx, cands, avails, s)
+            with self._sec('stage1/features'):
+                phi = route_features_v6(ctx, R, c2, c3, c4, s, a3, a4, spread3, corr4)
         else:
             cands, avails = [c2, c3], [ones, a3]
-            prior, ehat = loo_prior(x, ctx, c2, c3, a3, s)
-            phi = route_features_v5(ctx, R, c2, c3, s, a3, spread3)
-        avail = torch.stack(avails, dim=-1)
-        corr = self.router(phi)  # (B, L, C, K), E2 = reference (0)
-        pi = self._softmax_route(prior + corr, avail)
-        c_base = (pi * torch.stack(cands, dim=-1)).sum(dim=-1)
+            with self._sec('stage1/loo_prior'):
+                prior, ehat = loo_prior(x, ctx, c2, c3, a3, s)
+            with self._sec('stage1/features'):
+                phi = route_features_v5(ctx, R, c2, c3, s, a3, spread3)
+        with self._sec('stage1/router'):
+            avail = torch.stack(avails, dim=-1)
+            corr = self.router(phi)  # (B, L, C, K), E2 = reference (0)
+            pi = self._softmax_route(prior + corr, avail)
+            c_base = (pi * torch.stack(cands, dim=-1)).sum(dim=-1)
         return dict(ctx=ctx, cands=cands, avails=avails, prior=prior, ehat=ehat, phi=phi, corr=corr, avail=avail,
                     pi=pi, c_base=c_base)
 
@@ -401,8 +461,10 @@ class RADARWrapper(nn.Module):
 
         up, pad = to_patches(uc, self.P)  # (BC, N, P)
         BC = up.shape[0]
-        feats = point_features(up.reshape(BC, -1), self.det_feats).reshape(BC, self.N, self.P * self.n_point_feats)
-        logit_p = self._run(self.reliability, feats)  # unreliability logit ℓ = logit(1 − R)
+        with self._sec('detector'):
+            feats = point_features(up.reshape(BC, -1), self.det_feats).reshape(BC, self.N,
+                                                                                self.P * self.n_point_feats)
+            logit_p = self._run(self.reliability, feats)  # unreliability logit ℓ = logit(1 − R)
         R_p = 1.0 - torch.sigmoid(logit_p)
         R_in_p = R_p
         if rec_mask is not None:
@@ -413,9 +475,17 @@ class RADARWrapper(nn.Module):
         aux = dict(logit=logit, R=R, m=m, s=s, B=B, C=C, pad=pad)
         if self.arch in ('v5', 'v6'):
             R_in = from_patches(R_in_p, B, C, pad)
+            th_E = th_mask = None
+            if self.tail_hyp and need_route:
+                with self._sec('tail_hyp'):
+                    th_E, th_mask, th_w = self._tail_hypothesis(x, logit, R_in, s)
+                R_in = R_in * (1.0 - th_w.unsqueeze(1) * th_mask)
+                R_in_p, _ = to_patches(R_in, self.P)
+                aux.update(tail_E=th_E, tail_w=th_w, tail_mask=th_mask)
             st = self.stage1(x, R_in, s)
             u_base = ((st['c_base'] - m) / s).clamp(-self.u_clip, self.u_clip).detach()
-            delta_p, h = self._e1(R_in_p, up, u_base)
+            with self._sec('E1'):
+                delta_p, h = self._e1(R_in_p, up, u_base)
             delta = from_patches(delta_p, B, C, pad)
             aux['u_hat'] = u_base + delta  # reconstruction target frame; stage 1 detached
             target = st['c_base'] + delta * s  # forecast path: Router gradient through c_base
@@ -454,12 +524,17 @@ class RADARWrapper(nn.Module):
             aux.update(pi=pi, c=cand, avail=avail, cand_avail=avail, route_in=route_in,
                        gap=from_series(ctx['gap'], B, C))
 
-        Dt_p = self.compute_dependency(x, f) if compute_dep else x.new_ones(B, C, self.N)
-        Dt = patch_to_points(Dt_p, self.P, pad)  # (B, L, C)
+        with self._sec('dependency'):
+            Dt_p = self.compute_dependency(x, f) if compute_dep else x.new_ones(B, C, self.N)
+            Dt = patch_to_points(Dt_p, self.P, pad)  # (B, L, C)
+        gsec = self._sec('gate')
+        gsec.__enter__()
         z = (F.softplus(self.gate_a) * logit.clamp(-self.logit_clip, self.logit_clip)
              + F.softplus(self.gate_b) * torch.log(Dt + self.gate_eps))
         if self.gate_consistency:  # reconstruction-consistency evidence (repair detached)
             z = z + F.softplus(self.gate_g) * torch.log1p((target.detach() - x).abs() / s)
+        if self.arch in ('v5', 'v6') and th_E is not None:  # segment evidence of the tail hypothesis
+            z = z + F.softplus(self.th_h) * th_E.unsqueeze(1) * th_mask
         oracle = self.oracle_gate and self.oracle_mask is not None
         if self.force_gate_zero:
             gate_logit = torch.full_like(x, -float('inf'))
@@ -479,22 +554,53 @@ class RADARWrapper(nn.Module):
         else:
             x_tilde = x + alpha * (target - x)
 
+        gsec.__exit__(None, None, None)
         aux.update(alpha=alpha, gate_logit=gate_logit, gate_z=z.detach(), dbar=Dt, dbar_patch=Dt_p, x_tilde=x_tilde,
                    target=target)
         self.last_aux = aux
         return x_tilde, aux
+
+    def _tail_hypothesis(self, x, logit, R, s):
+        """H: the points from the strongest unreliability alarm among the last `tail_len` points to the end of the
+        window are corrupted (a shifted / held / zeroed tail whose inner points look locally normal). Stage 1 is
+        re-run with that segment excluded from the anchors (no gradient); the evidence E = log(1 + median over the
+        segment of |c_H − x| / s) per (window, channel) is large when the prefix cannot explain the segment.
+        Returns E (B, C), the segment mask (B, L, C) and w = σ(sp(k)(E − β)) (B, C), which scales R down on it."""
+        B, L, C = x.shape
+        K = min(self.tail_len, L)
+        j = (L - K) + logit[:, L - K:, :].detach().argmax(dim=1)  # (B, C)
+        t = torch.arange(L, device=x.device).view(1, L, 1)
+        seg = t >= j.unsqueeze(1)  # (B, L, C)
+        mask = seg.to(x.dtype)
+        prefix = self._tprefix
+        self._tprefix = 'tail_hyp/'
+        with torch.no_grad():
+            c_h = self.stage1(x, R.detach() * (1.0 - mask), s)['c_base']
+            E = torch.log1p(masked_median((c_h - x).abs() / s, seg, dim=1))
+            E = torch.nan_to_num(E, nan=0.0)
+        self._tprefix = prefix
+        w = torch.sigmoid(F.softplus(self.th_k) * (E - self.th_b))
+        return E, mask, w
 
     def forward(self, x, *bb_args, rec_mask=None, compute_dep=True, run_backbone=True):
         x_tilde, aux = self.repair(x, *bb_args, rec_mask=rec_mask, compute_dep=compute_dep)
         if not run_backbone:
             return None
         if 'rho' not in aux:
-            return _first(self.backbone(x_tilde, *bb_args))
-        # forecast-space mixing: one backbone call on [x; x̃]
+            with self._sec('backbone'):
+                return _first(self.backbone(x_tilde, *bb_args))
+        # forecast-space mixing. Exact saving: a window none of whose points is repaired has x̃ = x, hence
+        # f(x̃) = f(x); the second backbone pass runs only on the windows that were changed.
         B = x.shape[0]
-        args2 = [torch.cat([a, a], dim=0) if torch.is_tensor(a) and a.shape[:1] == (B,) else a for a in bb_args]
-        y = _first(self.backbone(torch.cat([x, x_tilde], dim=0), *args2))
-        y0, y1 = y[:B], y[B:]
+        with self._sec('backbone'):
+            idx = (aux['alpha'] >= 0.5).flatten(1).any(dim=1).nonzero(as_tuple=True)[0]
+            if idx.numel() == 0:
+                return _first(self.backbone(x, *bb_args))
+            args2 = [torch.cat([a, a[idx]], dim=0) if torch.is_tensor(a) and a.shape[:1] == (B,) else a
+                     for a in bb_args]
+            y = _first(self.backbone(torch.cat([x, x_tilde[idx]], dim=0), *args2))
+            y0 = y[:B]
+            y1 = y0.index_copy(0, idx, y[B:])
         rho = aux['rho']
         w = rho.unsqueeze(1) if y.shape[-1] == rho.shape[-1] else rho.amax(dim=-1).view(B, 1, 1)
         return y0 + w * (y1 - y0)

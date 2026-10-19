@@ -5,6 +5,8 @@
                                                           E1 is added when pre_<arch>.pth exists)
     python diag_v4.py det     <run_radar.py arguments>   step 3: detector AUROC per condition (needs pre_<arch>.pth;
                                                           --det_feats v3 evaluates the v3-feature detector)
+    python diag_v4.py timing  <run_radar.py arguments>   inference time of the plug-in per module vs B0
+                                                          (needs plugin_<arch>.pth)
 
 revin   For every corrupted window, four GTR (B0) forecasts:
           Clean        values clean,     RevIN statistics clean      (upper bound)
@@ -17,6 +19,10 @@ experts Oracle detection: R = 1 − mask (the corrupted points are known), so th
         the B0 forecast MSE after replacing the corrupted points by each expert (when base.pth exists).
 det     Detector only (S2 checkpoint, no gate): AUROC of ℓ with positives = corrupted points of the condition and
         negatives = all points of the clean windows; recall / false-alarm rate at R < 0.5 (ℓ > 0).
+timing  Wall-clock time of B0 and of the plug-in over a whole split for a few conditions (clean, a tail and an
+        internal corruption), then the same pass with CUDA-synchronised timers around each RADAR section (detector,
+        stage-1 experts / prior / features / router, tail hypothesis, E1, dependency, gate, backbone). Section
+        times include the synchronisation overhead, so they are reported as shares, not added to the total.
 Results: <results_dir>/diag/<setting>__<kind>.json and .md
 """
 import json
@@ -30,7 +36,7 @@ import torch
 import radar.compat  # noqa: F401
 from run_radar import _conditions, build_parser, set_seed
 
-KINDS = ('revin', 'experts', 'det')
+KINDS = ('revin', 'experts', 'det', 'timing')
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -289,6 +295,63 @@ def diag_det(exp, conds, split):
 
 
 # ----------------------------------------------------------------------------------------------------------------
+def diag_timing(exp, conds, split):
+    import time
+    from exp.exp_radar import ckpt_paths
+    paths = ckpt_paths(exp.args)
+    b0, _ = exp.load_method('B0', paths)
+    W, _ = exp.load_method('Ours-plugin', paths)
+    if b0 is None or W is None:
+        raise SystemExit(f'missing {paths["base"]} or {paths["plugin"]}: train S0 and the plug-in first')
+    use = [c for c in ('clean', 'zero_tail_k8_c100', 'flat_int_k8_c50') if c in conds] or list(conds[:2])
+    cuda = torch.cuda.is_available()
+
+    def sync():
+        if cuda:
+            torch.cuda.synchronize()
+
+    def run(model, batches):
+        sync()
+        t0 = time.perf_counter()
+        for _, x_p, _, _, c in batches:
+            model(x_p, c)
+        sync()
+        return time.perf_counter() - t0
+
+    per, secs = {}, {}
+    with torch.no_grad():
+        for cond in use:
+            batches = list(exp.perturbed_batches(cond, split))
+            n = sum(b[1].shape[0] for b in batches)
+            run(W, batches[:1])
+            run(b0, batches[:1])  # warm-up
+            t_b0, t_w = min(run(b0, batches) for _ in range(3)), min(run(W, batches) for _ in range(3))
+            W.timer = {}
+            run(W, batches)
+            secs[cond] = dict(W.timer)
+            W.timer = None
+            per[cond] = dict(n_windows=n, b0_ms_per_1k=1e6 * t_b0 / n, plugin_ms_per_1k=1e6 * t_w / n,
+                             ratio=t_w / max(t_b0, 1e-12))
+            print(f'  {cond:20s} B0 {per[cond]["b0_ms_per_1k"]:.2f} ms / 1k windows | plug-in '
+                  f'{per[cond]["plugin_ms_per_1k"]:.2f} ms | ×{per[cond]["ratio"]:.1f}')
+    md = [f'### Inference time ({split} split, {os.path.basename(paths["plugin"])}, batch {exp.args.batch_size})']
+    _table(md, ['condition', 'windows', 'B0 ms / 1k windows', 'plug-in ms / 1k windows', '× B0'],
+           [[c, str(r['n_windows']), _f(r['b0_ms_per_1k'], 2), _f(r['plugin_ms_per_1k'], 2), _f(r['ratio'], 1)]
+            for c, r in per.items()])
+    names = sorted({k for d in secs.values() for k in d}, key=lambda k: -sum(d.get(k, 0.0) for d in secs.values()))
+    md.append('### Share of the plug-in time per section (synchronised timers; tail_hyp/* is inside tail_hyp)')
+    rows = []
+    for k in names:
+        row = [k]
+        for c in use:
+            tot = sum(v for kk, v in secs[c].items() if '/' not in kk or kk.startswith('stage1/'))
+            row.append(f'{100 * secs[c].get(k, 0.0) / max(tot, 1e-12):.1f}%')
+        rows.append(row)
+    _table(md, ['section'] + use, rows)
+    return dict(per_condition=per, sections=secs), md
+
+
+# ----------------------------------------------------------------------------------------------------------------
 def main():
     if len(sys.argv) < 2 or sys.argv[1] not in KINDS:
         raise SystemExit(f'usage: python diag_v4.py {{{",".join(KINDS)}}} <run_radar.py arguments>')
@@ -308,7 +371,7 @@ def main():
     conds = _conditions(args)
     split = args.diag_split
     print(f'=== diag {kind} | {setting} | split {split} | {len(conds) - 1} conditions ===')
-    fn = {'revin': diag_revin, 'experts': diag_experts, 'det': diag_det}[kind]
+    fn = {'revin': diag_revin, 'experts': diag_experts, 'det': diag_det, 'timing': diag_timing}[kind]
     res, md = fn(exp, conds, split)
     res.update(kind=f'diag_{kind}', setting=setting, split=split, grid_seed=args.grid_seed)
     d = os.path.join(args.results_dir, 'diag')
