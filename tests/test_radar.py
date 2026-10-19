@@ -693,7 +693,9 @@ def test_v6_gate_calibration_window_budget():
     fake._to_dev = lambda bx, by, bc: (bx.float(), by.float(), bc.int())
     Exp_Radar._calibrate_gate(fake, W, loader)
     zs = torch.cat([W.gate_logit_without_tau(bx, bc.int()) for bx, _, _, _, bc in loader])
-    frac_w = (zs.amax(dim=1) > W.tau_raw).float().mean().item()
-    assert frac_w <= 0.05 + 1e-6 and W.seg_delta.item() >= 0
+    zw = zs.amax(dim=1)
+    frac_w = (zw > W.tau_raw).float().mean().item()
+    # torch.quantile interpolates between order statistics: up to one extra pair above τ on a small sample
+    assert frac_w <= 0.05 + 1.0 / zw.numel() + 1e-6 and W.seg_delta.item() >= 0
     tau_pt = W.tau_raw.item() - W.seg_delta.item()
     assert abs((zs > tau_pt).float().mean().item() - 0.01) < 0.01
