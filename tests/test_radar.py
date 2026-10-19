@@ -1,7 +1,8 @@
-"""RADAR v2 unit tests (B=4, L=96, C=7, H=96, cycle=24; randomly initialised GTR in eval mode).
+"""RADAR v4 unit tests (B=4, L=96, C=7, H=96, cycle=24; randomly initialised GTR in eval mode).
 
 Run from the repository root:  python -m pytest -q tests/test_radar.py
 """
+import json
 import math
 import os
 import sys
@@ -20,9 +21,12 @@ import radar.compat  # noqa: E402,F401
 from models import GTR as GTR_module  # noqa: E402
 from radar.dependency import hutchinson_dependency, patch_sum  # noqa: E402
 from radar.losses import (det_loss, hindsight_loss, hindsight_targets, patch_mask_to_points,  # noqa: E402
-                          radar_loss, rec_loss)
-from radar.modules import ReliableNeighborExpert, from_patches, hampel_filter, robust_stats, to_patches  # noqa: E402
-from radar.perturb import MixturePerturber, apply_test_perturbation, perturb_batch, raw_zero_from_scaler  # noqa: E402
+                          radar_loss, rec_loss, route_loss)
+from radar.modules import (ROUTE_FEATURES, LocalLinearExpert, PeriodicShapeExpert, ReliableNeighborExpert,  # noqa: E402
+                           from_patches, hampel_filter, point_features, reliable_context, robust_stats,
+                           shifted_windows, to_patches, to_series)
+from radar.perturb import (MixturePerturber, apply_condition, apply_test_perturbation, condition_rng,  # noqa: E402
+                           grid_conditions, parse_condition, perturb_batch, raw_zero_from_scaler)
 from radar.radar import RADARWrapper  # noqa: E402
 
 B, L, C, H, CYCLE = 4, 96, 7, 96, 24
@@ -33,7 +37,8 @@ def make_cfg(**kw):
         seq_len=L, pred_len=H, enc_in=C, cycle=CYCLE, d_model=512, dropout=0.5, use_revin=1, individual=0,
         radar_patch=8, radar_d=64, radar_heads=4, radar_layers=2, radar_dff=128, radar_dropout=0.1,
         radar_chunk=8192, u_clip=10.0, tau_init=1.0, gate_eps=1e-2, dep_mode='grad', dep_probes=4,
-        dep_probe_dist='rademacher', dep_ema=0.99, force_gate_zero=False, e2_k=3, e2_thr=0.5, e2_trend=1,
+        dep_probe_dist='rademacher', dep_ema=0.99, force_gate_zero=False, e2_k=3, e2_thr=0.5,
+        det_feats='v4', e3_period=24, e3_cycles=3, experts='e1,e2,e3', router='linear', route_temp_start=1.0,
         scale_std_frac=0.1, scale_min=1e-2,
         lam_det=0.5, lam_rec=0.5, lam_hind=0.5, lam_alpha=0.01, pos_weight=1.0, pu_neg_weight=0.1)
     for k, v in kw.items():
@@ -61,22 +66,27 @@ def make_wrapper(seed=0, **kw):
 
 
 # 1 ------------------------------------------------------------------------------------------------------
-def test_output_shape_matches_backbone():
-    W, bb, _ = make_wrapper()
+@pytest.mark.parametrize('router', ['linear', 'h'])
+def test_output_shape_matches_backbone(router):
+    W, bb, _ = make_wrapper(router=router)
     x, ci = make_batch()
     with torch.no_grad():
         y_bb = bb(x, ci)
         y = W(x, ci)
     assert y.shape == y_bb.shape == (B, H, C)
     aux = W.last_aux
-    for k in ('logit', 'R', 'alpha', 'dbar', 'u_hat', 'x_tilde', 'target'):
+    for k in ('logit', 'R', 'alpha', 'dbar', 'u_hat', 'x_tilde', 'target', 'gap'):
         assert aux[k].shape == (B, L, C), k
-    assert aux['pi'].shape == (B, L, C, 2) and aux['c'].shape == (B, L, C, 2)
+    assert aux['pi'].shape == (B, L, C, 3) and aux['c'].shape == (B, L, C, 3) and aux['avail'].shape == (B, L, C, 3)
     assert aux['dbar_patch'].shape == (B, C, L // 8)
+    assert torch.allclose(aux['pi'].sum(-1), torch.ones(B, L, C), atol=1e-5)
+    assert (aux['pi'][~aux['avail']] == 0).all()
+    if router == 'linear':
+        assert aux['route_in'].shape == (B, L, C, len(ROUTE_FEATURES))
 
 
 # 2 ------------------------------------------------------------------------------------------------------
-@pytest.mark.parametrize('dep_mode', ['grad', 'ema'])
+@pytest.mark.parametrize('dep_mode', ['grad', 'ema', 'none'])
 def test_force_gate_zero_is_identity_and_init_alpha_small(dep_mode):
     W, bb, _ = make_wrapper(force_gate_zero=True, dep_mode=dep_mode)
     x, ci = make_batch()
@@ -90,6 +100,8 @@ def test_force_gate_zero_is_identity_and_init_alpha_small(dep_mode):
     with torch.no_grad():
         W(x, ci)
     assert W.last_aux['alpha'].mean().item() < 0.02
+    if dep_mode == 'none':
+        assert torch.allclose(W.last_aux['dbar'], torch.ones_like(W.last_aux['dbar']))
 
 
 # 3 ------------------------------------------------------------------------------------------------------
@@ -113,14 +125,14 @@ def test_hutchinson_matches_exact_jacobian_column_energy(dist):
     D = hutchinson_dependency(toy, x, ci, H, n_probes=256, generator=g, dist=dist)
     exact = (toy.W.detach() ** 2).sum(0).reshape(L, C).unsqueeze(0).expand(B, L, C)
     rel = ((D - exact).norm() / exact.norm()).item()
-    assert rel < 0.10, rel  # Gaussian ≈ sqrt(2/256) ≈ 0.088; Rademacher is lower
+    assert rel < 0.10, rel
     assert toy.W.grad is None
     Dp = patch_sum(D, 8)
     assert Dp.shape == (B, C, L // 8) and torch.allclose(Dp.sum(-1), D.sum(1), rtol=1e-4)
 
 
 # 4 ------------------------------------------------------------------------------------------------------
-def test_T1_changes_only_last_point_to_raw_zero_and_not_y():
+def test_legacy_conditions_and_y_untouched():
     from sklearn.preprocessing import StandardScaler
     rng = np.random.default_rng(0)
     scaler = StandardScaler().fit(rng.normal(5.0, 2.0, size=(500, C)))
@@ -132,56 +144,144 @@ def test_T1_changes_only_last_point_to_raw_zero_and_not_y():
     y_copy = y.clone()
     xp, yp, mask = perturb_batch(x, y, 'T1_raw', rz)
     assert torch.equal(xp[:, :-1, :], x[:, :-1, :])
-    assert torch.equal(xp[:, -1, :], torch.as_tensor(rz).unsqueeze(0).expand(B, C))
+    assert torch.allclose(xp[:, -1, :], torch.as_tensor(rz).unsqueeze(0).expand(B, C))
     assert yp is y and torch.equal(y, y_copy)
     assert not mask[:, :-1, :].any() and mask[:, -1, :].all()
-
     xk, mk = apply_test_perturbation(x, 'T2_k4', rz)
     assert torch.equal(xk[:, :-4], x[:, :-4]) and mk[:, -4:].all()
-    assert 'flatline' not in MixturePerturber.TYPES
+    xf, mf = apply_test_perturbation(x, 'T3_flat', rz)
+    assert torch.equal(xf[:, -8:], x[:, -9:-8].expand(B, 8, C))
+
+
+def test_test_grid_definitions():
+    conds = grid_conditions('full')
+    assert conds[0] == 'clean' and len(conds) == 53 and len(grid_conditions('main')) == 27
+    rz = np.full(C, -4.0, dtype=np.float32)
+    x = torch.randn(32, L, C, generator=torch.Generator().manual_seed(3))
+    for cond in conds[1:]:
+        sp = parse_condition(cond)
+        xp, ch = apply_condition(x, cond, rz, 'raw', condition_rng(7, cond, 0), guard=8)
+        xp2, _ = apply_condition(x, cond, rz, 'raw', condition_rng(7, cond, 0), guard=8)
+        assert torch.equal(xp, xp2), cond  # deterministic
+        assert torch.equal(ch, (xp - x).abs() > 1e-6)
+        t_any = ch.any(dim=2)  # (B, L)
+        if sp['pos'] == 'int':
+            assert not t_any[:, L - 8:].any(), cond  # never touches the last patch
+        elif sp['type'] == 'spike':
+            assert not t_any[:, :L - 8].any(), cond
+        else:
+            assert not t_any[:, :L - sp['k']].any(), cond
+        if sp['ratio'] == 50:
+            assert (ch.any(dim=1).sum(dim=1) <= math.ceil(C / 2)).all(), cond
+        if sp['type'] == 'zero':
+            assert torch.allclose(xp[ch], torch.full_like(xp[ch], -4.0))
+
+
+def test_training_mixture_v4():
+    rz = np.zeros(C, dtype=np.float32) - 3.0
+    x, _ = make_batch()
+    x = torch.cat([x] * 16)
     pert = MixturePerturber(rz, p_apply=1.0, seed=0)
-    xm, mm, types_ = pert(x)
-    assert xm.shape == x.shape and (types_ >= 0).all()
+    xm, mm, ty = pert(x)
+    assert 'shift' not in MixturePerturber.TYPES and 'flat' in MixturePerturber.TYPES
+    assert xm.shape == x.shape and (ty >= 0).all() and set(pert.last_pos.tolist()) <= {0, 1}
     assert torch.equal(mm, (xm - x).abs() > 1e-6)
+    for b in range(x.shape[0]):
+        ts = torch.nonzero(mm[b].any(dim=1)).flatten()
+        if len(ts) and pert.last_pos[b] == 0:
+            assert ts.max() < L - 8
 
 
 # 5 ------------------------------------------------------------------------------------------------------
-def test_reliable_neighbor_expert_and_scale_floor():
+def test_point_features_v4_see_the_last_point():
+    z = torch.sin(torch.arange(L, dtype=torch.float32) / 5.0)
+    z2 = z.clone()
+    z2[-1] = 6.0
+    u = torch.stack([z, z2])
+    f3 = point_features(u, 'v3')
+    f4 = point_features(u, 'v4')
+    assert f3.shape == (2, L, 3) and f4.shape == (2, L, 5)
+    assert f3[1, -1, 2].abs() < 1e-6  # v3: |u − med5| is always 0 at the last point
+    assert f4[1, -1, 2] > 3 and f4[1, -1, 3] > 3
+    w = shifted_windows(torch.arange(20.).view(1, 20), 5)
+    assert torch.equal(w[0, -1], torch.arange(15., 20.)) and torch.equal(w[0, 10], torch.arange(8., 13.))
+    flat = z.clone()
+    flat[40:48] = flat[39]
+    f = point_features(flat.view(1, -1), 'v4')
+    assert (f[0, 42:46, 4] == 0).all() and (f[0, 20:24, 4] > 0).all()  # MAD5 = 0 on a flat segment
+
+
+def test_reliable_context():
+    M = torch.ones(1, 20, dtype=torch.bool)
+    M[0, 5:9] = False
+    M[0, 17:] = False
+    ctx = reliable_context(M, 3)
+    assert ctx['gap'][0, 4] == 0 and (ctx['gap'][0, 5:9] == 4).all() and (ctx['gap'][0, 17:] == 3).all()
+    assert ctx['dl'][0, 8] == 4 and ctx['dr'][0, 5] == 4 and (ctx['dr'][0, 17:] == 20).all()
+    assert ctx['pb'][0, 6].tolist() == [4, 3, 2] and ctx['pf'][0, 6].tolist() == [9, 10, 11]
+    assert not ctx['vf'][0, 18].any()
+
+
+def test_local_linear_and_periodic_experts_are_exact_on_ideal_signals():
+    # E2: a straight line with an internal gap is recovered exactly; at the window end -> level of the last 3 points
+    lin = 0.5 * torch.arange(40.) + 2.0
+    x = lin.clone()
+    x[10:16] = -9.0
+    x[35:] = -9.0
+    R = torch.ones(40)
+    R[10:16] = 0
+    R[35:] = 0
+    x, R = x.view(1, 40, 1), R.view(1, 40, 1)
+    ctx = reliable_context(to_series(R) > 0.5, 3)
+    c2 = LocalLinearExpert()(x, ctx)[0, :, 0]
+    assert torch.allclose(c2[10:16], lin[10:16], atol=1e-4)
+    assert torch.allclose(c2[35:], lin[32:35].median().expand(5))
+    # E3: periodic signal + linear trend, internal (k=8) and tail (k=6) gaps -> exact; E2 is not
+    t = torch.arange(96.)
+    sig = torch.sin(2 * math.pi * t / 24) + 0.3 * torch.cos(4 * math.pi * t / 24) + 0.02 * t
+    x = sig.clone()
+    x[40:48] = 0.0
+    x[90:] = 0.0
+    R = torch.ones(96)
+    R[40:48] = 0
+    R[90:] = 0
+    x, R = x.view(1, 96, 1), R.view(1, 96, 1)
+    ctx = reliable_context(to_series(R) > 0.5, 3)
+    c2 = LocalLinearExpert()(x, ctx)
+    c3, a3, _ = PeriodicShapeExpert(24, 96, 3)(x, ctx, fill=c2)
+    assert a3.all()
+    for sl in (slice(40, 48), slice(90, 96)):
+        assert (c3[0, sl, 0] - sig[sl]).abs().max() < 1e-4
+        assert (c2[0, sl, 0] - sig[sl]).abs().max() > 0.5
+    # T >= L: E3 unavailable, returns the fill
+    c3o, a3o, _ = PeriodicShapeExpert(96, 96, 3)(x, ctx, fill=c2)
+    assert not a3o.any() and torch.equal(c3o, c2)
+
+
+def test_legacy_reliable_neighbor_expert_and_scale_floor():
     E2 = ReliableNeighborExpert(k=3, thr=0.5, trend=True)
     g = torch.Generator().manual_seed(7)
     x = torch.randn(1, 20, 1, generator=g)
-    x[:, -4:] = -5.0  # contiguous corruption of the last 4 points (T2_k4-like)
+    x[:, -4:] = -5.0
     R = torch.ones_like(x)
     R[:, -4:] = 0.0
     c = E2(x, R)[0, :, 0]
     z = x[0, :, 0]
-    # interior point: median of the 3 reliable points before and the 3 after (corrupted ones skipped)
-    t = 10
-    assert torch.allclose(c[t], torch.cat([z[t - 3:t], z[t + 1:t + 4]]).median())
-    # last point: nothing reliable after -> level (median) + OLS trend of the last 3 reliable points (13..15)
-    pts = z[13:16]
-    tt = torch.tensor([13.0, 14.0, 15.0])
-    slope = ((tt - tt.mean()) * (pts - pts.mean())).sum() / ((tt - tt.mean()) ** 2).sum()
-    assert torch.allclose(c[19], pts.median() + slope * (19 - tt.mean()), atol=1e-5)
-    assert not torch.isclose(c[19], torch.tensor(-5.0))  # a plain local median would return the zeroed value
-    # no reliable point at all -> window median, finite
-    c0 = E2(x, torch.zeros_like(x))
-    assert torch.isfinite(c0).all() and torch.allclose(c0[0, :, 0], z.median().expand(20))
-
+    assert torch.allclose(c[10], torch.cat([z[7:10], z[11:14]]).median())
     flat = torch.ones(2, 96, 3)
     m, s = robust_stats(flat)
     assert torch.allclose(s, torch.full_like(s, 1e-2)) and torch.isfinite((flat - m) / s).all()
 
 
 # 6 ------------------------------------------------------------------------------------------------------
-def test_gradients_joint_and_stage_b():
+def test_gradients_joint_stage_b_and_route_loss():
     W, bb, cfg = make_wrapper()
     x, ci = make_batch()
     y = torch.randn(B, H, C)
     x_p = x.clone()
-    x_p[:, -1, :] = -3.0
-    mask = torch.zeros(B, L, C, dtype=torch.bool)
-    mask[:, -1, :] = True
+    x_p[:, -4:, :] = -3.0
+    x_p[:, 30:34, :2] = 4.0
+    mask = (x_p - x).abs() > 1e-6
     rec_mask = torch.rand(B * C, W.N, generator=torch.Generator().manual_seed(0)) < 0.1
 
     # joint loss: every RADAR module receives a finite gradient
@@ -198,6 +298,16 @@ def test_gradients_joint_and_stage_b():
     for p in (W.gate_a, W.gate_b, W.tau_raw):
         assert p.grad is not None and torch.isfinite(p.grad).all()
 
+    # L_route: gradients only w.r.t. the Router, non-zero, finite
+    W.zero_grad(set_to_none=True)
+    W(x_p, ci)
+    lr = route_loss(W, W.last_aux, x_p, mask, y, (ci,), H)
+    rp = list(W.router.parameters())
+    gr = torch.autograd.grad(lr, rp)
+    assert all(torch.isfinite(g).all() for g in gr) and any(g.abs().sum() > 0 for g in gr)
+    assert all(p.grad is None for p in W.parameters())
+    assert route_loss(W, W.last_aux, x, torch.zeros_like(mask), y, (ci,), H) is None
+
     # stage B: backbone + stage-A modules frozen -> only Router and gate are trained
     for p in list(W.backbone.parameters()) + W.stage_a_parameters():
         p.requires_grad_(False)
@@ -210,6 +320,32 @@ def test_gradients_joint_and_stage_b():
     assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in W.gate_parameters())
     assert all(p.grad is None for p in W.stage_a_parameters())
     assert all(p.grad is None for p in W.backbone.parameters())
+
+
+def test_routing_temperature_argmax_and_disabled_experts():
+    W, _, _ = make_wrapper(experts='e1,e2')
+    x, ci = make_batch()
+    with torch.no_grad():
+        W(x, ci)
+    assert (W.last_aux['pi'][..., 2] == 0).all() and not W.last_aux['avail'][..., 2].any()
+    W2, _, _ = make_wrapper(e3_period=96)  # T >= L -> E3 unavailable everywhere
+    with torch.no_grad():
+        W2(x, ci)
+    assert (W2.last_aux['pi'][..., 2] == 0).all()
+    W3, _, _ = make_wrapper()
+    with torch.no_grad():
+        W3.router.lin.bias.copy_(torch.tensor([0.5, -0.5]))
+        W3.set_route_temp(0.3)
+        W3(x, ci)
+        pi_soft = W3.last_aux['pi']
+        W3.route_hard = True
+        W3(x, ci)
+        pi_hard = W3.last_aux['pi']
+    assert torch.equal(pi_hard.argmax(-1), pi_soft.argmax(-1))
+    assert torch.equal(pi_hard.sum(-1), torch.ones_like(pi_hard.sum(-1))) and set(pi_hard.unique().tolist()) <= {0., 1.}
+    assert 'route_temp' in W3.state_dict() and abs(W3.state_dict()['route_temp'].item() - 0.3) < 1e-6
+    coef = W3.router_coefficients()
+    assert set(coef) == {'LocalLinear', 'PeriodicShape'} and abs(coef['LocalLinear']['bias'] - 0.5) < 1e-6
 
 
 # 7 ------------------------------------------------------------------------------------------------------
@@ -242,7 +378,7 @@ def test_losses_pu_and_rec_frame():
 
     x_clean = torch.randn(2, 8, 3)
     m, s = torch.zeros(2, 1, 3), torch.full((2, 1, 3), 2.0)
-    u_hat = x_clean / 2.0  # perfect reconstruction in the corrupted window's frame (m, s)
+    u_hat = x_clean / 2.0
     assert rec_loss(u_hat, x_clean, torch.ones_like(mask), 10.0, m, s).item() < 1e-10
 
 
@@ -255,6 +391,15 @@ def test_patch_roundtrip_and_hampel():
     assert pad2 == 3 and torch.equal(from_patches(xp2, B, C, pad2), x2)
     hf = hampel_filter(x)
     assert hf.shape == x.shape and torch.isfinite(hf).all()
+
+
+def test_seq_len_not_multiple_of_patch():
+    W, bb, _ = make_wrapper(seq_len=93)
+    x = torch.randn(B, 93, C)
+    ci = torch.randint(0, CYCLE, (B,)).int()
+    with torch.no_grad():
+        out = W(x, ci)
+    assert out.shape == (B, H, C) and W.last_aux['pi'].shape == (B, 93, C, 3)
 
 
 def test_ema_profile_and_global_scale():
@@ -299,3 +444,47 @@ def test_other_gtr_backbones(name):
         ref = bb(x, ci)
         out = W(x, ci)
     assert out.shape == ref.shape
+
+
+def test_revin_forward_reproduces_gtr():
+    from diag_v4 import revin_forward
+    cfg = make_cfg()
+    bb = make_gtr(cfg)
+    x, ci = make_batch()
+    x2 = x.clone()
+    x2[:, -4:] = 5.0
+    with torch.no_grad():
+        assert torch.allclose(revin_forward(bb, x, x, ci), bb(x, ci), atol=1e-5)
+        assert not torch.allclose(revin_forward(bb, x, x2, ci), bb(x, ci), atol=1e-3)
+    assert bb.use_revin == 1
+
+
+def test_eval_stats_and_summary(tmp_path):
+    from exp.exp_radar import RadarStats, hist_auroc
+    from radar.summary import summarize
+    W, _, _ = make_wrapper(dep_mode='none')
+    x, ci = make_batch()
+    rz = np.full(C, -3.0, dtype=np.float32)
+    st_clean, st = RadarStats(3), RadarStats(3)
+    with torch.no_grad():
+        W(x, ci)
+        st_clean.update(W.last_aux, x, x, torch.zeros_like(x, dtype=torch.bool))
+        xp, ch = apply_condition(x, 'zero_tail_k4_c100', rz, 'raw', condition_rng(0, 'zero_tail_k4_c100', 0))
+        W(xp, ci)
+        st.update(W.last_aux, x, xp, ch)
+    r = st.result()
+    assert r['n_changed'] == int(ch.sum()) and r['err_raw'] > 0 and len(r['pi_open_by_gap']) == 5
+    a = hist_auroc(st.hist_pos, st_clean.hist_all)
+    assert 0.0 <= a <= 1.0
+    raw = tmp_path / 'raw'
+    raw.mkdir()
+    for m in ('B0', 'Ours-plugin'):
+        rec = dict(kind='eval', method=m, dataset='ETTh1', pred_len=96, seed=2024,
+                   conditions={'clean': dict(mse=0.4, mae=0.4), 'zero_tail_k4_c100': dict(mse=0.6, mae=0.5)},
+                   extras={'clean': st_clean.result(), 'zero_tail_k4_c100': dict(r, auroc=a),
+                           'router_coef': W.router_coefficients(), 'experts': list(W.expert_names),
+                           'route_features': list(ROUTE_FEATURES), 'gate': W.gate_values()} if m != 'B0' else {})
+        (raw / f'x__{m}.json').write_text(json.dumps(rec))
+    summarize(str(tmp_path), print_tables=False)
+    assert 'Zero-T' in (tmp_path / 'summary.md').read_text()
+    assert 'PeriodicShape vs Repairer' in (tmp_path / 'summary_router.md').read_text()

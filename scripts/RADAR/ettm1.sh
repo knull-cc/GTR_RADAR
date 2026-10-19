@@ -10,6 +10,7 @@ data_name=ETTm1
 
 seq_len=96
 cycle=96
+e3_period=96   # RADAR E3: daily period of the data (steps); E3 is off when e3_period >= seq_len
 GTR_ARGS=(--features M --seq_len $seq_len --enc_in 7 --cycle $cycle --train_epochs 30 --patience 5 --dropout 0.5 --itr 1 --batch_size 256 --learning_rate 0.001 )
 
 source "$(dirname "$0")/common.sh"

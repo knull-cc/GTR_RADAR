@@ -1,36 +1,49 @@
 #!/usr/bin/env bash
-# Shared RADAR pipeline, sourced by scripts/RADAR/<dataset>.sh.
-# The dataset script defines: model_name root_path_name data_path_name model_id_name data_name seq_len cycle GTR_ARGS
+# Shared RADAR v4 pipeline, sourced by scripts/RADAR/<dataset>.sh.
+# The dataset script defines: model_name root_path_name data_path_name model_id_name data_name seq_len cycle
+#                             e3_period GTR_ARGS
 #
 # Environment knobs:
+#   MODE=full        S0 -> S1 (GTR+Aug) -> S2 -> S3 plug-in -> eval on the test grid (default)
+#   MODE=revin       step 1: S0 (reused if base.pth exists) + RevIN 2×2 diagnostic on B0   (diag_v4.py revin)
+#   MODE=experts     step 2: offline expert repair errors (+ E1 if pre_v4.pth exists)       (diag_v4.py experts)
+#   MODE=det         step 3: S0 + S2 + detector AUROC per condition                         (diag_v4.py det)
+#                    DET_FEATS=v3 evaluates the v3-feature detector (separate checkpoint pre_v4_detv3.pth)
+#   MODE=diag        v3 clean-headroom audit (diag_clean.py)
 #   QUICK=1          pred_len 96, seed 2024, plus the original run.py reproduction check (REPRO=1)
-#   PRED_LENS="..."  SEEDS="..."   override the grid (default: 96 192 336 720 x 2024 2025 2026)
+#   PRED_LENS="..."  SEEDS="..."   override the grid (default: 96 192 336 720 x 2024)
 #   REPRO=0/1        run run_orig.py (= original run.py) + repro_check before continuing
 #   REPRO_STRICT=1   stop if |S0 - run.py| / run.py >= 2%  (default 1)
 #   BACKBONE=GTR     GTR | GTRiTransformer | GTRPatchTST | GTRDLinear
 #   EXTRA_ARGS="..." extra run.py-compatible args for every call (e.g. "--num_workers 4")
-#   RADAR_ARGS="..." extra RADAR-only args (e.g. "--hind_level channel", "--conditions clean,T1_raw,T2_k4,T3_flat")
+#   RADAR_ARGS="..." extra RADAR-only args (e.g. "--test_grid main", "--router h", "--experts e1,e2")
 #   ABLATION=1       also train/evaluate Ours (joint training, backbone fine-tuned) as an ablation
+#   ARGMAX=1         also evaluate the plug-in with hard (argmax) routing (Ours-argmax)
 #   SKIP_EXISTING=1  reuse checkpoints that already exist (default 1; set 0 to retrain)
-#   PY=python  LOG_DIR=./logs_radar  RESULTS_DIR=./results_radar/  CKPT_DIR=./checkpoints_radar/
+#   PY=python  LOG_DIR=./logs_radar_v4  RESULTS_DIR=./results_radar_v4/  CKPT_DIR=./checkpoints_radar/
 set -eo pipefail
 
 QUICK=${QUICK:-0}
+MODE=${MODE:-full}
 BACKBONE=${BACKBONE:-$model_name}
 if [ "$QUICK" = "1" ]; then
   PRED_LENS=${PRED_LENS:-"96"}; SEEDS=${SEEDS:-"2024"}; REPRO=${REPRO:-1}
 else
-  PRED_LENS=${PRED_LENS:-"96 192 336 720"}; SEEDS=${SEEDS:-"2024 2025 2026"}; REPRO=${REPRO:-0}
+  PRED_LENS=${PRED_LENS:-"96 192 336 720"}; SEEDS=${SEEDS:-"2024"}; REPRO=${REPRO:-0}
 fi
 REPRO_STRICT=${REPRO_STRICT:-1}
 ABLATION=${ABLATION:-0}
+ARGMAX=${ARGMAX:-0}
 PY=${PY:-python}
-LOG_DIR=${LOG_DIR:-./logs_radar}
-RESULTS_DIR=${RESULTS_DIR:-./results_radar/}
+LOG_DIR=${LOG_DIR:-./logs_radar_v4}
+RESULTS_DIR=${RESULTS_DIR:-./results_radar_v4/}
 CKPT_DIR=${CKPT_DIR:-./checkpoints_radar/}
 SKIP_EXISTING=${SKIP_EXISTING:-1}
 EXTRA_ARGS=${EXTRA_ARGS:-}
 RADAR_ARGS=${RADAR_ARGS:-}
+if [ -n "${DET_FEATS:-}" ]; then RADAR_ARGS="$RADAR_ARGS --det_feats $DET_FEATS"; fi
+E3_ARGS=()
+if [ -n "${e3_period:-}" ]; then E3_ARGS=(--e3_period "$e3_period"); fi
 mkdir -p "$LOG_DIR" "$RESULTS_DIR/raw"
 
 check_data() {
@@ -41,18 +54,22 @@ check_data() {
   fi
 }
 
-run_one() {
-  local pred_len=$1 seed=$2
-  local mid=${model_id_name}_${seq_len}_${pred_len}
-  local setting=${mid}_${BACKBONE}_${data_name}_ftM_sl${seq_len}_pl${pred_len}_cycle${cycle}_seed${seed}
-  local data_args=(--root_path "$root_path_name" --data_path "$data_path_name" --model_id "$mid" --data "$data_name"
-                   --pred_len "$pred_len" --random_seed "$seed")
+# sets: mid setting data_args common log
+_setup() {
+  local pred_len=$1 seed=$2 skip=$3
+  mid=${model_id_name}_${seq_len}_${pred_len}
+  setting=${mid}_${BACKBONE}_${data_name}_ftM_sl${seq_len}_pl${pred_len}_cycle${cycle}_seed${seed}
+  data_args=(--root_path "$root_path_name" --data_path "$data_path_name" --model_id "$mid" --data "$data_name"
+             --pred_len "$pred_len" --random_seed "$seed")
   # shellcheck disable=SC2206
-  local common=("${data_args[@]}" "${GTR_ARGS[@]}" --backbone "$BACKBONE" --radar_ckpt_dir "$CKPT_DIR"
-                --results_dir "$RESULTS_DIR" --skip_existing "$SKIP_EXISTING" $EXTRA_ARGS $RADAR_ARGS)
-  local log=$LOG_DIR/$setting
-  echo "================ $setting ================"
+  common=("${data_args[@]}" "${GTR_ARGS[@]}" "${E3_ARGS[@]}" --backbone "$BACKBONE" --radar_ckpt_dir "$CKPT_DIR"
+          --results_dir "$RESULTS_DIR" --skip_existing "$skip" $EXTRA_ARGS $RADAR_ARGS)
+  log=$LOG_DIR/$setting
+}
 
+run_one() {
+  _setup "$1" "$2" "$SKIP_EXISTING"
+  echo "================ $setting ================"
   if [ "$REPRO" = "1" ]; then
     # shellcheck disable=SC2086
     RADAR_REPRO_OUT="$RESULTS_DIR/raw/${setting}__orig.json" \
@@ -69,6 +86,7 @@ run_one() {
   $PY -u run_radar.py pretrain_radar "${common[@]}" 2>&1 | tee "${log}__S2.log"
   $PY -u run_radar.py train_radar    "${common[@]}" --freeze_backbone 2>&1 | tee "${log}__S3plugin.log"
   local methods="B0,B1,B2,Ours-plugin"
+  if [ "$ARGMAX" = "1" ]; then methods="$methods,Ours-argmax"; fi
   if [ "$ABLATION" = "1" ]; then  # joint training (backbone also fine-tuned) = ablation only
     $PY -u run_radar.py train_radar  "${common[@]}" 2>&1 | tee "${log}__S3.log"
     methods="$methods,Ours"
@@ -76,16 +94,18 @@ run_one() {
   $PY -u run_radar.py eval           "${common[@]}" --methods "$methods" 2>&1 | tee "${log}__eval.log"
 }
 
+run_step_one() {  # MODE = revin | experts | det
+  _setup "$1" "$2" 1
+  echo "================ [$MODE] $setting ================"
+  $PY -u run_radar.py train_base "${common[@]}" 2>&1 | tee "${log}__S0.log"
+  if [ "$MODE" = "det" ]; then
+    $PY -u run_radar.py pretrain_radar "${common[@]}" 2>&1 | tee "${log}__S2${DET_FEATS:+_det$DET_FEATS}.log"
+  fi
+  $PY -u diag_v4.py "$MODE" "${common[@]}" 2>&1 | tee "${log}__diag_${MODE}${DET_FEATS:+_det$DET_FEATS}.log"
+}
+
 run_diag_one() {
-  local pred_len=$1 seed=$2
-  local mid=${model_id_name}_${seq_len}_${pred_len}
-  local setting=${mid}_${BACKBONE}_${data_name}_ftM_sl${seq_len}_pl${pred_len}_cycle${cycle}_seed${seed}
-  local data_args=(--root_path "$root_path_name" --data_path "$data_path_name" --model_id "$mid" --data "$data_name"
-                   --pred_len "$pred_len" --random_seed "$seed")
-  # shellcheck disable=SC2206
-  local common=("${data_args[@]}" "${GTR_ARGS[@]}" --backbone "$BACKBONE" --radar_ckpt_dir "$CKPT_DIR"
-                --results_dir "$RESULTS_DIR" --skip_existing 1 $EXTRA_ARGS $RADAR_ARGS)
-  local log=$LOG_DIR/$setting
+  _setup "$1" "$2" 1
   echo "================ [diag] $setting ================"
   $PY -u run_radar.py train_base "${common[@]}" 2>&1 | tee "${log}__S0.log"
   if [ "${DIAG_PLUGIN:-0}" = "1" ]; then
@@ -97,22 +117,28 @@ run_diag_one() {
 
 run_all() {
   check_data
-  if [ "${MODE:-full}" = "diag" ]; then
-    for pred_len in $PRED_LENS; do for seed in $SEEDS; do run_diag_one "$pred_len" "$seed"; done; done
-    return
-  fi
+  case "$MODE" in
+    revin|experts|det)
+      for pred_len in $PRED_LENS; do for seed in $SEEDS; do run_step_one "$pred_len" "$seed"; done; done
+      return ;;
+    diag)
+      for pred_len in $PRED_LENS; do for seed in $SEEDS; do run_diag_one "$pred_len" "$seed"; done; done
+      return ;;
+    full) ;;
+    *) echo "unknown MODE=$MODE (full | revin | experts | det | diag)"; exit 1 ;;
+  esac
   for pred_len in $PRED_LENS; do
     for seed in $SEEDS; do
       run_one "$pred_len" "$seed"
     done
   done
   # shellcheck disable=SC2086
-  $PY -u run_radar.py summarize --results_dir "$RESULTS_DIR" $RADAR_ARGS 2>&1 | tee "$LOG_DIR/summary_${model_id_name}.log"
+  $PY -u run_radar.py summarize --results_dir "$RESULTS_DIR" 2>&1 | tee "$LOG_DIR/summary_${model_id_name}.log"
   local p0 s0
   p0=$(echo $PRED_LENS | awk '{print $1}'); s0=$(echo $SEEDS | awk '{print $1}')
   # shellcheck disable=SC2086
   $PY -u run_radar.py plot --root_path "$root_path_name" --data_path "$data_path_name" \
     --model_id "${model_id_name}_${seq_len}_${p0}" --data "$data_name" --pred_len "$p0" --random_seed "$s0" \
-    "${GTR_ARGS[@]}" --backbone "$BACKBONE" --radar_ckpt_dir "$CKPT_DIR" --results_dir "$RESULTS_DIR" \
-    $EXTRA_ARGS $RADAR_ARGS 2>&1 | tee "$LOG_DIR/plot_${model_id_name}.log"
+    "${GTR_ARGS[@]}" "${E3_ARGS[@]}" --backbone "$BACKBONE" --radar_ckpt_dir "$CKPT_DIR" \
+    --results_dir "$RESULTS_DIR" $EXTRA_ARGS $RADAR_ARGS 2>&1 | tee "$LOG_DIR/plot_${model_id_name}.log"
 }

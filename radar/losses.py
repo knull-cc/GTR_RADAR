@@ -2,7 +2,8 @@
 
 Stage A (pretrain_radar): L_det + L_rec                       (ReliabilityNet, Repairer)
 Stage B (plug-in)       : MSE(ŷ, y) + λ_hind·L_hind           (Router + gate a, b, τ)
-Joint ablation          : MSE + λ_det·L_det + λ_rec·L_rec + λ_hind·L_hind + λ_α·mean(α)   (0.5, 0.5, 0.5, 0.01)
+Joint / plug-in 'all'   : MSE + λ_det·L_det + λ_rec·L_rec + λ_hind·L_hind + λ_α·mean(α)   (0.5, 0.5, 0.5, 0.01)
+All S3 variants (v4)    : + λ_route·L_route (0.5), gradient w.r.t. the Router only (see route_loss)
 
 L_det is a PU (positive-unlabeled) loss: injected points are positives; natural points are *unlabeled* and only
 get a small negative weight (pu_neg_weight, default 0.1), so genuinely bad natural points can still be flagged.
@@ -108,6 +109,26 @@ def hindsight_loss(alpha, targets, P, f_dim=0):
     w = targets['w'].expand(B, 2, C)
     bce = F.binary_cross_entropy(a_p, h, reduction='none')
     return (w * bce).mean()
+
+
+def route_loss(W, aux, x_in, pert_mask, y, bb_args, pred_len, f_dim=0):
+    """L_route = MSE(f(x + m ⊙ (Σ_k π_k · sg(c_k) − x)), y) on the perturbed samples of the batch.
+
+    The repair location is given by the perturbation mask m (not by the gate α), so the Router receives a forecast
+    signal wherever a corruption is; π is recomputed from the *detached* Router input (W.route_probs), so only the
+    Router depends on it. Callers take gradients w.r.t. the Router parameters only (see Exp_Radar.train_radar).
+    Returns None when the batch holds no perturbed sample."""
+    sel = pert_mask.flatten(1).any(dim=1)  # (B,)
+    if not bool(sel.any()):
+        return None
+    pi = W.route_probs(aux)  # (B, L, C, K)
+    c = (pi * aux['c'].detach()).sum(dim=-1)
+    m = pert_mask.to(x_in.dtype)
+    x_r = (x_in + m * (c - x_in))[sel]
+    args = [a[sel] if torch.is_tensor(a) and a.shape[:1] == sel.shape else a for a in bb_args]
+    out = W.backbone(x_r, *args)
+    out = out[0] if isinstance(out, (tuple, list)) else out
+    return F.mse_loss(out[:, -pred_len:, f_dim:], y[sel])
 
 
 def radar_loss(y_hat, y, aux, x_clean, pert_mask, rec_mask_pts=None, hind=None, cfg=None, stage='joint'):

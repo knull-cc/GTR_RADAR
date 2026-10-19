@@ -4,13 +4,14 @@
 
 commands:
   train_base      S0  plain backbone, original training recipe (no per-epoch test pass)      -> base.pth
-  train_aug       S1  fine-tune backbone with the RADAR augmentation mixture (fair control)  -> aug.pth
-  pretrain_radar  S2  frozen backbone, RADAR only (L_det + L_rec)                            -> pre.pth
-  train_radar     S3  joint training, full loss (add --freeze_backbone for the plug-in)      -> radar.pth / plugin.pth
-  eval                B0, B1 (GTR+Aug), B2 (Hampel), Ours-plugin [+ Ours ablation] x {clean, T1_raw, T2_k4}
-  summarize           results_radar/raw/*.json -> results_radar/summary.csv (+ markdown tables)
-  plot                figures_radar/ (dependency profiles, example windows)
+  train_aug       S1  fine-tune backbone with the RADAR v4 augmentation mixture (control)    -> aug_v4.pth
+  pretrain_radar  S2  frozen backbone, RADAR only (L_det + L_rec)                            -> pre_v4.pth
+  train_radar     S3  joint training, full loss (add --freeze_backbone for the plug-in)      -> radar_v4 / plugin_v4.pth
+  eval                B0, B1 (GTR+Aug), B2 (Hampel), Ours-plugin [+ Ours, Ours-argmax] x the v4 test grid
+  summarize           <results_dir>/raw/*.json -> summary.csv / summary_extras.csv / summary.md
+  plot                figures (dependency profiles, example windows)
   repro_check         compare S0 test MSE with the original run.py (see run_orig.py)
+Diagnostics (validation split): python diag_v4.py {revin,experts,det} [same arguments]
 """
 import argparse
 import json
@@ -113,19 +114,34 @@ def build_parser():
     g.add_argument('--gate_eps', type=float, default=1e-2, help='ε in log(D̃ + ε)')
     g.add_argument('--scale_std_frac', type=float, default=0.1, help='robust scale floor: frac * window std')
     g.add_argument('--scale_min', type=float, default=1e-2, help='robust scale absolute floor')
-    g.add_argument('--e2_k', type=int, default=3, help='E2: reliable neighbours per side')
-    g.add_argument('--e2_thr', type=float, default=0.5, help='E2: reliability threshold')
-    g.add_argument('--e2_trend', type=int, default=0, help='E2: linear trend at the window end (off: no gain on ETTh1)')
-    g.add_argument('--dep_mode', type=str, default='ema', choices=['grad', 'ema'],
-                   help='ema: backbone EMA profile (no inference overhead); grad: per-sample Hutchinson')
+    g.add_argument('--det_feats', type=str, default='v4', choices=['v4', 'v3'],
+                   help='detector point features: v4 = u, du, |u-med5|, |u-med17|, MAD5 (shifted windows); v3 = 3')
+    g.add_argument('--e2_k', type=int, default=3, help='E2/E3: reliable anchor points per side')
+    g.add_argument('--e2_thr', type=float, default=0.5, help='E2/E3/Router: reliability threshold R > thr')
+    g.add_argument('--e2_trend', type=int, default=0, help='(v3 E2 only; unused by the v4 local linear expert)')
+    g.add_argument('--e3_period', type=int, default=-1,
+                   help='E3 period T in steps (daily period of the dataset); -1 = --cycle; 0 = off. '
+                        'E3 is unavailable when T >= seq_len')
+    g.add_argument('--e3_cycles', type=int, default=3, help='E3 template: same-phase points t ± jT, j = 1..n')
+    g.add_argument('--experts', type=str, default='e1,e2,e3', help='enabled experts (e1 required), e.g. e1,e2')
+    g.add_argument('--router', type=str, default='linear', choices=['linear', 'h'],
+                   help='linear: named per-point features (interpretable); h: v3 Router on the Repairer state')
+    g.add_argument('--lam_route', type=float, default=0.5,
+                   help='weight of L_route (forecast loss with corrupted points routed-repaired; Router only)')
+    g.add_argument('--route_temp_start', type=float, default=1.0, help='Router softmax temperature, S3 epoch 1')
+    g.add_argument('--route_temp_end', type=float, default=0.3, help='Router softmax temperature, last S3 epoch')
+    g.add_argument('--dep_mode', type=str, default='ema', choices=['grad', 'ema', 'none'],
+                   help='ema: backbone EMA profile (no inference overhead); grad: per-sample Hutchinson; '
+                        'none: no dependency term in the gate')
     g.add_argument('--dep_probes', type=int, default=4, help='Hutchinson probes K')
     g.add_argument('--dep_probe_dist', type=str, default='rademacher', choices=['rademacher', 'gaussian'])
     g.add_argument('--dep_ema', type=float, default=0.99, help='EMA momentum of the dependency profile')
-    g.add_argument('--use_cycle_prior', type=int, default=0, help='(E3 removed in RADAR v2)')
+    g.add_argument('--use_cycle_prior', type=int, default=0, help='(unused: the GTR-aligned CyclePrior was removed)')
     g.add_argument('--force_gate_zero', action='store_true', default=False)
     g.add_argument('--freeze_backbone', action='store_true', default=False, help='S3 plug-in mode')
     g.add_argument('--zero_mode', type=str, default='raw', choices=['raw', 'scaled'])
-    g.add_argument('--p_perturb', type=float, default=0.5)
+    g.add_argument('--p_perturb', type=float, default=0.5, help='training mixture: P(window perturbed)')
+    g.add_argument('--p_tail', type=float, default=0.5, help='training mixture: P(tail position | perturbed)')
     g.add_argument('--lam_det', type=float, default=0.5)
     g.add_argument('--lam_rec', type=float, default=0.5)
     g.add_argument('--lam_hind', type=float, default=0.5)
@@ -156,16 +172,25 @@ def build_parser():
     g.add_argument('--hampel_mad_scale', type=float, default=1.0, help='1.0 = literal 3*MAD; 1.4826 = 3 sigma')
     g.add_argument('--use_tf32', type=int, default=1)
     g.add_argument('--quick', action='store_true', default=False, help='1 seed (2024), pred_len 96')
+    g.add_argument('--ckpt_tag', type=str, default='', help='extra tag appended to the RADAR checkpoint names')
     g.add_argument('--skip_existing', type=int, default=0, help='skip a training stage if its checkpoint exists')
     g.add_argument('--methods', type=str, default='B0,B1,B2,Ours-plugin',
-                   help='add Ours for the joint-training ablation')
-    g.add_argument('--conditions', type=str, default='clean,T1_raw,T2_k4',
-                   help='test conditions; all: clean,T1_raw,T1_scaled,T2_k4,T2_k8,T3_flat')
+                   help='add Ours (joint-training ablation) or Ours-argmax (plug-in with hard routing)')
+    g.add_argument('--conditions', type=str, default='grid',
+                   help="'grid' = the v4 test grid (--test_grid), or a comma list of condition names "
+                        "(e.g. zero_tail_k4_c100; legacy T1_raw, T2_k4, T3_flat ...)")
+    g.add_argument('--test_grid', type=str, default='full', choices=['full', 'main'],
+                   help='full: 100%% and 50%% of the channels; main: 100%% only (half the evaluation time)')
+    g.add_argument('--no_ood', action='store_true', default=False, help='drop the OOD type (shift) from the grid')
+    g.add_argument('--grid_seed', type=int, default=20261019, help='seed of the test-grid perturbations')
+    g.add_argument('--diag_split', type=str, default='val', choices=['val', 'test'], help='split of diag_v4.py')
     g.add_argument('--radar_ckpt_dir', type=str, default='./checkpoints_radar/')
-    g.add_argument('--results_dir', type=str, default='./results_radar/')
-    g.add_argument('--fig_dir', type=str, default='./figures_radar/')
+    g.add_argument('--results_dir', type=str, default='./results_radar_v4/')
+    g.add_argument('--fig_dir', type=str, default='./figures_radar_v4/')
     g.add_argument('--plot_datasets', type=str, default='ETTh1,weather')
     g.add_argument('--n_examples', type=int, default=3)
+    g.add_argument('--plot_conditions', type=str, default='zero_tail_k4_c100,flat_int_k8_c100',
+                   help='test-grid conditions of the example figures')
     return parser
 
 
@@ -176,14 +201,17 @@ def set_seed(seed):
 
 
 def _conditions(args):
-    from radar.perturb import ALL_CONDITIONS
+    from radar.perturb import grid_conditions, is_valid_condition
+    if args.conditions.strip() in ('grid', 'full', 'main'):
+        grid = args.test_grid if args.conditions.strip() == 'grid' else args.conditions.strip()
+        return grid_conditions(grid, ood=not args.no_ood)
     conds = [c.strip() for c in args.conditions.split(',') if c.strip()]
-    bad = [c for c in conds if c not in ALL_CONDITIONS]
+    bad = [c for c in conds if not is_valid_condition(c)]
     if bad:
-        raise SystemExit(f'unknown condition(s) {bad}; choose from {ALL_CONDITIONS}')
-    if 'clean' not in conds:
-        conds = ['clean'] + conds
-    return conds
+        raise SystemExit(f'unknown condition(s) {bad}; use type_pos_k<k>_c<ratio> (e.g. zero_tail_k4_c100) or a '
+                         f'legacy name (T1_raw, T1_scaled, T2_k<k>, T3_flat)')
+    conds = [c for c in conds if c != 'clean']
+    return ['clean'] + conds
 
 
 def raw_dir(args):
@@ -210,7 +238,7 @@ def main():
     cmd = args.command
     if cmd == 'summarize':
         from radar.summary import summarize
-        summarize(args.results_dir, conditions=_conditions(args))
+        summarize(args.results_dir)
         return
 
     from exp.exp_radar import Exp_Radar, ckpt_paths, setting_name
@@ -224,10 +252,15 @@ def main():
         if args.skip_existing and os.path.exists(paths['base']) and os.path.exists(out_json):
             print(f'skip: {paths["base"]} exists')
             return
-        print('Args in experiment:')
-        print(args)
         exp = Exp_Radar(args, use_radar=False)
-        exp.train(setting, ckpt_path=paths['base'])
+        if args.skip_existing and os.path.exists(paths['base']):
+            # base.pth (pure GTR) is shared with earlier RADAR versions: reuse it, only write the S0 record
+            print(f'reuse: {paths["base"]} exists, evaluating clean test MSE only')
+            exp.model.load_state_dict(torch.load(paths['base'], map_location=exp.device))
+        else:
+            print('Args in experiment:')
+            print(args)
+            exp.train(setting, ckpt_path=paths['base'])
         res = exp.test(conditions=('clean',), timing=False)
         clean = res['conditions']['clean']
         with open(out_json, 'w') as f:

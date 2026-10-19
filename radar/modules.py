@@ -80,17 +80,47 @@ def points_to_patch_max(z, P, fill=0.0):
 
 
 def rolling_median(z, k=5):
-    """Centered rolling median along the last axis of z (M, T); border values replicated."""
+    """(v3) Centered rolling median along the last axis of z (M, T); border values replicated."""
     h = k // 2
     zp = torch.cat([z[:, :1].expand(-1, h), z, z[:, -1:].expand(-1, h)], dim=1)
     return zp.unfold(1, k, 1).median(dim=-1).values
 
 
-def point_features(u):
-    """u: (M, T) robust-scaled series -> (M, T, 3) = [u_t, Δu_t (0 at t=0), |u_t - median5_t|]."""
+def shifted_windows(z, w):
+    """z: (M, T) -> (M, T, w). For every t the w-point window [start, start + w) with
+    start = clamp(t − w//2, 0, T − w): centred inside the series, *shifted* (not padded) at both ends, so it always
+    holds w real points and the last point only sees its left context."""
+    M, T = z.shape
+    w = min(int(w), T)
+    win = z.unfold(1, w, 1)  # (M, T − w + 1, w)
+    start = (torch.arange(T, device=z.device) - w // 2).clamp(0, T - w)
+    return win[:, start]
+
+
+N_POINT_FEATURES = {'v3': 3, 'v4': 5}
+POINT_FEATURE_NAMES = {'v3': ('u', 'du', '|u-med5|'),
+                       'v4': ('u', 'du', '|u-med5|', '|u-med17|', 'MAD5(u)')}
+
+
+def point_features(u, version='v4'):
+    """u: (M, T) robust-scaled series -> (M, T, F).
+
+    v3 (F=3): [u_t, Δu_t, |u_t − med5_t|] with a centred, replicate-padded median (|·| ≡ 0 at the last point).
+    v4 (F=5): [u_t, Δu_t, |u_t − med5_t|, |u_t − med17_t|, MAD5(u)_t] with shifted windows (see shifted_windows):
+      * med17 covers corrupted runs of up to 8 points, where the 5-point median is dominated by the run itself;
+      * MAD5 = median_j |u_j − med5| inside the same 5-point window (u is already divided by s): high on noise
+        segments, ~0 on flat / constant segments.
+    """
     du = torch.cat([torch.zeros_like(u[:, :1]), u[:, 1:] - u[:, :-1]], dim=1)
-    dev = (u - rolling_median(u, 5)).abs()
-    return torch.stack([u, du, dev], dim=-1)
+    if version == 'v3':
+        dev = (u - rolling_median(u, 5)).abs()
+        return torch.stack([u, du, dev], dim=-1)
+    assert version == 'v4', version
+    w5 = shifted_windows(u, 5)
+    med5 = w5.median(dim=-1).values
+    med17 = shifted_windows(u, 17).median(dim=-1).values
+    mad5 = (w5 - med5.unsqueeze(-1)).abs().median(dim=-1).values
+    return torch.stack([u, du, (u - med5).abs(), (u - med17).abs(), mad5], dim=-1)
 
 
 # --------------------------------------------------------------------------------------
@@ -113,14 +143,14 @@ class PatchTransformer(nn.Module):
 class ReliabilityNet(nn.Module):
     """Point-level unreliability logits ℓ_t; R_t = 1 - sigmoid(ℓ_t)."""
 
-    def __init__(self, P, N, d_model=64, n_heads=4, n_layers=2, d_ff=128, dropout=0.1, head_bias=-4.0):
+    def __init__(self, P, N, d_model=64, n_heads=4, n_layers=2, d_ff=128, dropout=0.1, head_bias=-4.0, n_feat=3):
         super().__init__()
         self.P = P
-        self.body = PatchTransformer(3 * P, N, d_model, n_heads, n_layers, d_ff, dropout)
+        self.body = PatchTransformer(n_feat * P, N, d_model, n_heads, n_layers, d_ff, dropout)
         self.head = nn.Linear(d_model, P)
         nn.init.constant_(self.head.bias, head_bias)
 
-    def forward(self, feats):  # feats: (M, N, 3P) -> logits (M, N, P)
+    def forward(self, feats):  # feats: (M, N, F·P) -> logits (M, N, P)
         return self.head(self.body(feats))
 
 
@@ -139,23 +169,266 @@ class Repairer(nn.Module):
 
 
 class Router(nn.Module):
-    """Per-point softmax over K experts from the Repairer hidden state."""
+    """(v3, `--router h`) per-point expert logits from the Repairer hidden state."""
 
     def __init__(self, d_model, P, n_experts=3):
         super().__init__()
         self.P, self.K = P, n_experts
         self.proj = nn.Linear(d_model, n_experts * P)
 
-    def forward(self, h, expert_mask=None):  # h: (M, N, d) -> π: (M, N, P, K)
+    def forward(self, h):  # h: (M, N, d) -> logits (M, N, P, K)
         M, N, _ = h.shape
-        logits = self.proj(h).reshape(M, N, self.P, self.K)
-        if expert_mask is not None:  # bool (K,), False = disabled expert
-            logits = logits.masked_fill(~expert_mask.view(1, 1, 1, -1), float('-inf'))
-        return torch.softmax(logits, dim=-1)
+        return self.proj(h).reshape(M, N, self.P, self.K)
+
+
+# --------------------------------------------------------------------------------------
+# Series layout helpers: (B, L, C, ...) <-> (B*C, L, ...)
+# --------------------------------------------------------------------------------------
+def to_series(x):
+    B, L, C = x.shape[:3]
+    return x.transpose(1, 2).reshape(B * C, L, *x.shape[3:])
+
+
+def from_series(z, B, C):
+    L = z.shape[1]
+    return z.reshape(B, C, L, *z.shape[2:]).transpose(1, 2)
+
+
+# --------------------------------------------------------------------------------------
+# Reliable context (shared by E2, E3 and the Router features). M: bool (S, L), True = reliable (R > thr).
+# --------------------------------------------------------------------------------------
+def nearest_reliable(M, K):
+    """Positions of the K nearest reliable points strictly before / strictly after every t.
+    Returns pb, vb, pf, vf, each (S, L, K); pb/pf hold a valid index (clamped) wherever vb/vf is False."""
+    S, L = M.shape
+    ar = torch.arange(L, device=M.device)
+    order = torch.where(M, ar, ar + L).argsort(dim=1)  # reliable positions first, in time order
+    n_rel = M.sum(dim=1, keepdim=True)  # (S, 1)
+    cs = M.long().cumsum(dim=1)  # reliable count in [0, t]
+    before = cs - M.long()  # reliable count in [0, t)
+    ks = torch.arange(1, K + 1, device=M.device)
+    rb = before.unsqueeze(-1) - ks  # rank of the k-th reliable point before t
+    vb = rb >= 0
+    pb = torch.gather(order, 1, rb.clamp_min(0).reshape(S, -1)).reshape(S, L, K)
+    rf = cs.unsqueeze(-1) + ks - 1  # rank of the k-th reliable point after t
+    vf = rf < n_rel.unsqueeze(-1)
+    pf = torch.gather(order, 1, rf.clamp_max(L - 1).reshape(S, -1)).reshape(S, L, K)
+    return pb, vb, pf, vf
+
+
+def reliable_context(M, K=3):
+    """Everything the parameter-free experts and the Router need about the reliable points of each series.
+
+    gap   : length of the unreliable run containing t (0 if t is reliable; window borders bound the run)
+    dl/dr : distance to the nearest reliable point at/before (after) t (0 if t is reliable, L if there is none)
+    has_l / has_r : a reliable point exists at/before (at/after) t
+    pb, vb, pf, vf: K nearest reliable points strictly before / after t (see nearest_reliable)
+    """
+    S, L = M.shape
+    ar = torch.arange(L, device=M.device).view(1, L).expand(S, L)
+    last = torch.where(M, ar, torch.full_like(ar, -1)).cummax(dim=1).values
+    nxt = torch.where(M, ar, torch.full_like(ar, L)).flip(1).cummin(dim=1).values.flip(1)
+    has_l, has_r = last >= 0, nxt < L
+    zero = torch.zeros_like(ar)
+    big = torch.full_like(ar, L)
+    gap = torch.where(M, zero, nxt - last - 1)
+    dl = torch.where(M, zero, torch.where(has_l, ar - last, big))
+    dr = torch.where(M, zero, torch.where(has_r, nxt - ar, big))
+    pb, vb, pf, vf = nearest_reliable(M, K)
+    return dict(M=M, gap=gap, dl=dl, dr=dr, has_l=has_l, has_r=has_r, pb=pb, vb=vb, pf=pf, vf=vf)
+
+
+def _side(z, p, v):
+    """Robust level of z at the anchor positions p (S, L, K) where v (and z finite).
+    Returns (nanmedian level, mean anchor position, any-valid), each (S, L)."""
+    S, L, K = p.shape
+    vals = torch.gather(z, 1, p.reshape(S, -1)).reshape(S, L, K)
+    v = v & torch.isfinite(vals)
+    lev = torch.nanmedian(torch.where(v, vals, torch.full_like(vals, float('nan'))), dim=-1).values
+    w = v.to(z.dtype)
+    pos = (w * p.to(z.dtype)).sum(-1) / w.sum(-1).clamp_min(1.0)
+    return lev, pos, v.any(dim=-1)
+
+
+def _interp(t, lev_b, pos_b, has_b, lev_f, pos_f, has_f, fallback):
+    """Linear interpolation between the left and right levels where both exist, one-sided level otherwise."""
+    w = ((t - pos_b) / (pos_f - pos_b).clamp_min(1e-6)).clamp(0.0, 1.0)
+    both = lev_b + w * (lev_f - lev_b)
+    return torch.where(has_b & has_f, both, torch.where(has_b, lev_b, torch.where(has_f, lev_f, fallback)))
 
 
 # --------------------------------------------------------------------------------------
 # Parameter-free experts
+# --------------------------------------------------------------------------------------
+class LocalLinearExpert(nn.Module):
+    """E2 (v4): "the gap is a straight line between its reliable neighbours" — no periodic information.
+
+    Left / right level = median of the k nearest reliable points before / after t (anchored at their mean position):
+      both sides  -> linear interpolation of the two levels at t
+      one side    -> that side's level (no trend extrapolation)
+      no reliable -> window median.
+    Works on x directly; R is detached (through the context).
+    """
+
+    def forward(self, x, ctx):  # x: (B, L, C), ctx from reliable_context on to_series layout -> (B, L, C)
+        B, L, C = x.shape
+        z = to_series(x)
+        t = torch.arange(L, device=x.device, dtype=z.dtype).view(1, L)
+        lb, pb, hb = _side(z, ctx['pb'], ctx['vb'])
+        lf, pf, hf = _side(z, ctx['pf'], ctx['vf'])
+        fallback = z.median(dim=1, keepdim=True).values.expand_as(z)
+        out = _interp(t, lb, pb, hb, lf, pf, hf, fallback)
+        out = torch.where(torch.isfinite(out), out, fallback)
+        return from_series(out, B, C)
+
+
+class PeriodicShapeExpert(nn.Module):
+    """E3 (v4): "the gap has the same shape as the same-phase segments of the other cycles in the window".
+
+    Uses only the window itself (no backbone parameter, no cycle_index; the phase is aligned implicitly by t + jT).
+    For every other cycle j = ±1..±n_cycles (offset jT):
+      level offset  d_j = median over the k nearest reliable anchors a before (after) t of (x_a − x_{a+jT}),
+                    interpolated linearly between the left and the right anchors (one-sided where only one exists)
+      candidate     c_t^(j) = x_{t+jT} + d_j(t)          (seasonal naive from cycle j, corrected to the local level)
+    c3_t = median_j c_t^(j)  over the cycles whose same-phase point is inside the window and reliable.
+    The per-cycle level correction keeps the repair exact under a linear trend (a single median template is not).
+    Unavailable where T ≥ L, where no cycle qualifies, or where no anchor pair exists; there `fill` is returned and
+    avail = False. spread = median_j |c_t^(j) − c3_t| (disagreement between cycles).
+    """
+
+    def __init__(self, period, seq_len, n_cycles=3):
+        super().__init__()
+        self.T = int(period) if period else 0
+        self.enabled = 0 < self.T < int(seq_len)
+        offs = [j * self.T for j in range(-int(n_cycles), int(n_cycles) + 1) if j != 0] if self.enabled else [0]
+        self.register_buffer('offsets', torch.tensor(offs, dtype=torch.long), persistent=False)
+
+    @staticmethod
+    def _take(z, Mu, idx):
+        """z (S, L) values, Mu (S, L) uint8 reliable mask, idx (S, ...) positions (may leave the window)
+        -> values and validity (inside the window and reliable), both shaped like idx."""
+        S, L = z.shape
+        inb = (idx >= 0) & (idx < L)
+        flat = idx.clamp(0, L - 1).reshape(S, -1)
+        v = torch.gather(z, 1, flat).reshape(idx.shape)
+        ok = torch.gather(Mu, 1, flat).reshape(idx.shape).bool() & inb
+        return v, ok
+
+    def _level_offsets(self, z, Mu, p, v):
+        """Anchors p, v (S, L, K) -> d_j (S, L, J), mean anchor position (S, L, J), any valid pair (S, L, J)."""
+        S, L, K = p.shape
+        J = self.offsets.shape[0]
+        xa = torch.gather(z, 1, p.reshape(S, -1)).reshape(S, L, K, 1)
+        xs, oks = self._take(z, Mu, p.unsqueeze(-1) + self.offsets.view(1, 1, 1, J))  # (S, L, K, J)
+        ok = v.unsqueeze(-1) & oks
+        diff = torch.where(ok, xa - xs, torch.full_like(xs, float('nan')))
+        lev = torch.nanmedian(diff, dim=2).values
+        w = ok.to(z.dtype)
+        pos = (w * p.unsqueeze(-1).to(z.dtype)).sum(dim=2) / w.sum(dim=2).clamp_min(1.0)
+        return lev, pos, ok.any(dim=2)
+
+    def forward(self, x, ctx, fill):
+        """x, fill: (B, L, C). Returns c3 (B, L, C), avail (bool, B, L, C), spread (B, L, C) (0 where unavailable)."""
+        B, L, C = x.shape
+        if not self.enabled:
+            return fill, torch.zeros_like(x, dtype=torch.bool), torch.zeros_like(x)
+        z = to_series(x)
+        S = z.shape[0]
+        Mu = ctx['M'].to(torch.uint8)
+        J = self.offsets.shape[0]
+        ar = torch.arange(L, device=x.device)
+        idx = (ar.view(L, 1) + self.offsets.view(1, J)).view(1, L, J).expand(S, L, J)
+        v_t, ok_t = self._take(z, Mu, idx)  # same-phase values x_{t+jT}
+        db, pb, hb = self._level_offsets(z, Mu, ctx['pb'], ctx['vb'])
+        df, pf, hf = self._level_offsets(z, Mu, ctx['pf'], ctx['vf'])
+        t = ar.to(z.dtype).view(1, L, 1)
+        nan = torch.full_like(v_t, float('nan'))
+        d = _interp(t, db, pb, hb, df, pf, hf, nan)
+        cand = torch.where(ok_t, v_t + d, nan)  # (S, L, J), NaN where cycle j does not qualify
+        c3 = torch.nanmedian(cand, dim=-1).values
+        spread = torch.nanmedian((cand - c3.unsqueeze(-1)).abs(), dim=-1).values
+        avail = torch.isfinite(c3)
+        c3 = torch.where(avail, c3, to_series(fill))
+        spread = torch.where(avail & torch.isfinite(spread), spread, torch.zeros_like(spread))
+        return from_series(c3, B, C), from_series(avail, B, C), from_series(spread, B, C)
+
+
+# --------------------------------------------------------------------------------------
+# Interpretable Router (v4, `--router linear`)
+# --------------------------------------------------------------------------------------
+LENGTH_BINS = ('0', '1', '2-4', '5-8', '>8')
+ROUTE_FEATURES = (
+    tuple(f'gap={b}' for b in LENGTH_BINS[1:]) +  # reference: gap = 0 (reliable point)
+    ('support=left only', 'support=right only', 'support=none') +  # reference: both sides
+    tuple(f'dist_left={b}' for b in LENGTH_BINS[1:]) +  # reference: 0
+    tuple(f'dist_right={b}' for b in LENGTH_BINS[1:]) +
+    ('reliable density ±4', 'log1p Δ(c1,c2)/s', 'log1p Δ(c1,c3)/s', 'log1p Δ(c2,c3)/s',
+     'E3 available', 'log1p E3 spread/s'))
+
+
+def length_bin(v):
+    """Long tensor ≥ 0 -> bin index 0..4 for {0, 1, 2–4, 5–8, > 8}."""
+    return (v >= 1).long() + (v >= 2).long() + (v >= 5).long() + (v >= 9).long()
+
+
+def _onehot_ref(idx, n):
+    """One-hot without the reference category 0: (…,) -> (…, n − 1)."""
+    return torch.nn.functional.one_hot(idx, n)[..., 1:]
+
+
+def route_features(ctx, R, c, s, avail3, spread3):
+    """Named, detached per-point routing features φ (B, L, C, len(ROUTE_FEATURES)).
+
+    ctx: reliable_context (series layout); R: (B, L, C); c: (B, L, C, 3) candidates; s: (B, 1, C) robust scale;
+    avail3 / spread3: E3 availability and template spread (B, L, C)."""
+    B, L, C = R.shape
+    dt = R.dtype
+    hl, hr = ctx['has_l'], ctx['has_r']
+    support = (hl & ~hr).long() * 1 + (~hl & hr).long() * 2 + (~hl & ~hr).long() * 3  # 0 = both sides
+    parts = [_onehot_ref(length_bin(ctx['gap']), 5), _onehot_ref(support, 4),
+             _onehot_ref(length_bin(ctx['dl']), 5), _onehot_ref(length_bin(ctx['dr']), 5)]
+    parts = [p.to(dt) for p in parts]
+    Rs = to_series(R.detach())
+    dens = torch.nn.functional.avg_pool1d(Rs.unsqueeze(1), 9, stride=1, padding=4,
+                                          count_include_pad=False).squeeze(1)
+    cs = to_series(c.detach())  # (S, L, 3)
+    ss = to_series(s.expand(B, L, C))  # (S, L)
+    a3 = to_series(avail3).to(dt)
+    d12 = torch.log1p((cs[..., 0] - cs[..., 1]).abs() / ss)
+    d13 = torch.log1p((cs[..., 0] - cs[..., 2]).abs() / ss) * a3
+    d23 = torch.log1p((cs[..., 1] - cs[..., 2]).abs() / ss) * a3
+    sp = torch.log1p(to_series(spread3) / ss) * a3
+    parts += [dens.unsqueeze(-1), d12.unsqueeze(-1), d13.unsqueeze(-1), d23.unsqueeze(-1), a3.unsqueeze(-1),
+              sp.unsqueeze(-1)]
+    phi = torch.cat(parts, dim=-1)
+    return from_series(phi, B, C).detach()
+
+
+class LinearRouter(nn.Module):
+    """logit_k = w_kᵀφ + b_k for the experts k = 2..K; E1 (Repairer) is the reference expert with logit 0, so every
+    coefficient reads as a log-odds of "expert k instead of E1" relative to the reference bins. Zero-initialised
+    (uniform routing over the available experts)."""
+
+    def __init__(self, n_features=len(ROUTE_FEATURES), n_experts=3):
+        super().__init__()
+        self.K = n_experts
+        self.lin = nn.Linear(n_features, n_experts - 1)
+        nn.init.zeros_(self.lin.weight)
+        nn.init.zeros_(self.lin.bias)
+
+    def forward(self, phi):  # (..., F) -> logits (..., K)
+        z = self.lin(phi)
+        return torch.cat([torch.zeros_like(z[..., :1]), z], dim=-1)
+
+    def coefficients(self, expert_names, feature_names=ROUTE_FEATURES):
+        W = self.lin.weight.detach().cpu().numpy()
+        b = self.lin.bias.detach().cpu().numpy()
+        return {name: dict(bias=float(b[i]), **{f: float(W[i, j]) for j, f in enumerate(feature_names)})
+                for i, name in enumerate(expert_names[1:])}
+
+
+# --------------------------------------------------------------------------------------
+# Legacy / reference experts (diagnostics and the v3 comparison)
 # --------------------------------------------------------------------------------------
 class LocalMedianExpert(nn.Module):
     """c_t = median of the neighbours in [t-h, t+h] excluding t itself (NaN padding + nanmedian)."""
@@ -174,7 +447,7 @@ class LocalMedianExpert(nn.Module):
 
 
 class ReliableNeighborExpert(nn.Module):
-    """E2: median of the nearest *reliable* neighbours (R > thr; up to k before and k after t).
+    """(v3 E2, kept for the offline comparison) median of the nearest *reliable* neighbours (R > thr; up to k before and k after t).
 
     Unlike a plain local median it keeps working under contiguous corruption (e.g. the last 4/8 points zeroed):
     corrupted neighbours are skipped. When no reliable point exists after t (end of the window), it falls back to
@@ -228,41 +501,6 @@ class ReliableNeighborExpert(nn.Module):
         out = torch.where(has_f, both, torch.where(has_b, end_val, fallback))
         out = torch.where(torch.isfinite(out), out, fallback)
         return out.reshape(B, C, L).permute(0, 2, 1)
-
-
-def gtr_gather_index(cycle_index, seq_len, cycle_len):
-    """Exactly the retrieval index used in models/GTR.py."""
-    return (cycle_index.view(-1, 1) +
-            torch.arange(seq_len, device=cycle_index.device).view(1, -1)) % cycle_len
-
-
-class CyclePriorExpert(nn.Module):
-    """Re-uses the backbone's global cycle matrix Q (detached; no new parameters).
-
-    Weighted least squares per sample/channel: x_t ≈ a*q_t + b with weights w_t = R_t (detached).
-    """
-
-    def __init__(self, eps=1e-6, a_max=10.0):
-        super().__init__()
-        self.eps = eps
-        self.a_max = a_max
-
-    def forward(self, x, cycle_index, Q, w):
-        Qd = Q.detach()
-        gi = gtr_gather_index(cycle_index, x.shape[1], Qd.shape[0])
-        q = Qd[gi]  # (B, L, C)
-        w = w.detach()
-        wsum = w.sum(dim=1, keepdim=True)
-        w = torch.where(wsum < 1e-6, torch.ones_like(w), w)  # all-zero weights -> uniform
-        wsum = w.sum(dim=1, keepdim=True)
-        mq = (w * q).sum(1, keepdim=True) / wsum
-        mx = (w * x).sum(1, keepdim=True) / wsum
-        cov = (w * (q - mq) * (x - mx)).sum(1, keepdim=True) / wsum
-        var = (w * (q - mq) ** 2).sum(1, keepdim=True) / wsum
-        a = (cov / (var + self.eps)).clamp(0.0, self.a_max)
-        a = torch.where(var < self.eps, torch.zeros_like(a), a)
-        b = mx - a * mq
-        return a * q + b, q
 
 
 # --------------------------------------------------------------------------------------
