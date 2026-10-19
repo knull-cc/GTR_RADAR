@@ -459,9 +459,10 @@ class RADARWrapper(nn.Module):
         return from_patches(u_hat_p, B, C, pad) * s + m
 
     # ------------------------------------------------------------------ forward
-    def repair(self, x, *bb_args, rec_mask=None, compute_dep=True, need_route=True):
+    def repair(self, x, *bb_args, rec_mask=None, compute_dep=True, need_route=True, drop_mask=None):
         """Returns x̃ and the aux dict. rec_mask: optional bool (B*C, N) of patches whose R is forced to 0
-        (masked-reconstruction training; in v5 those patches are also unreliable for stage 1). need_route=False
+        (masked-reconstruction training; in v5 those patches are also unreliable for stage 1). drop_mask: optional
+        bool (B, L, C) of points whose R is forced to 0 (v5 / v6; label-free masked-forecast training). need_route=False
         skips the dependency and the gate (stage-A training only needs ℓ and û; v4 also skips E2/E3/Router)."""
         B, L, C = x.shape
         f = self._closure(bb_args)
@@ -491,6 +492,9 @@ class RADARWrapper(nn.Module):
         aux = dict(logit=logit, R=R, m=m, s=s, B=B, C=C, pad=pad)
         if self.arch in ('v5', 'v6'):
             R_in = from_patches(R_in_p, B, C, pad)
+            if drop_mask is not None:
+                R_in = R_in * (~drop_mask).to(R_in.dtype)
+                R_in_p, _ = to_patches(R_in, self.P)
             th_E = th_mask = None
             if self.tail_hyp and need_route:
                 with self._sec('tail_hyp'):

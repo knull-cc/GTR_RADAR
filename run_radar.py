@@ -143,6 +143,13 @@ def build_parser():
                    help='v6 without any injected corruption: detector = stage-1 leave-one-out residual (no labels), '
                         'E1 / Router trained with random masks on clean data (S2), gate not trained but calibrated '
                         'on clean windows (S3). Checkpoint suffix _lf')
+    g.add_argument('--lf_train', type=int, default=1,
+                   help='label-free S3: masked-forecast training of E1 + Router on clean windows (random gaps, '
+                        'values hidden, never corrupted); 0 = calibration only')
+    g.add_argument('--lf_mask_p', type=float, default=0.5, help='label-free S3: share of series with a gap')
+    g.add_argument('--lf_clean_budget', type=float, default=0.01,
+                   help='label-free gate: largest window repair rate whose clean validation MSE stays within '
+                        '(1 + budget) x the MSE without repair; < 0 = off (5%% window budget only)')
     g.add_argument('--tail_hyp', type=int, default=0,
                    help='tail-segment hypothesis (v5/v6): test "the window end from the strongest tail alarm on is '
                         'corrupted" against a stage-1 repair anchored before it; its evidence lowers R on that '

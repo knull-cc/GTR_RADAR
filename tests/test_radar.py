@@ -865,5 +865,49 @@ def test_label_free_s2_loss_and_calibration():
                torch.randint(0, CYCLE, (B,), generator=g)) for _ in range(2)]
     Exp_Radar._calibrate_gate(fake, W, loader)
     assert math.isfinite(float(W.lf_q0)) and float(W.lf_q0) > 0
-    a = types.SimpleNamespace(arch='v6', experts='auto', label_free=1, ckpt_tag='')
+    a = types.SimpleNamespace(arch='v6', experts='auto', label_free=1, lf_train=0, ckpt_tag='')
     assert ckpt_suffix(a, 'pre') == '_lf' and ckpt_suffix(a, 'plugin') == '_lf'
+
+
+def test_label_free_masked_forecast_training_and_clean_budget():
+    from exp.exp_radar import Exp_Radar, ckpt_suffix
+    W, _, _ = make_wrapper(arch='v6', label_free=1, dep_mode='none')
+    fake = types.SimpleNamespace(args=types.SimpleNamespace(u_clip=10.0, pred_len=H, lf_mask_p=0.5, lf_clean_budget=0.01,
+                                                            tau_calib_batches=2, tau_calib_frac=0.01,
+                                                            tau_calib_wfrac=0.05),
+                                 f_dim=0, device=torch.device('cpu'))
+    fake._to_dev = lambda bx, by, bc: (bx.float(), by.float(), bc.int())
+    g = torch.Generator().manual_seed(2)
+    M = Exp_Radar._lf_masks(fake, 64, L, C, gen=g)
+    runs = M.sum(dim=1)  # gap length per (window, channel)
+    assert M.shape == (64, L, C) and int(runs.max()) <= 16 and 0.2 < (runs > 0).float().mean() < 0.8
+    assert M[:, -1].any() and M[:, : L - 24].any()  # tail and internal gaps
+    x, ci = make_batch()
+    y = torch.randn(B, H, C)
+    M = torch.zeros_like(x, dtype=torch.bool)
+    M[:, -6:, :3] = True
+    W.train()
+    mse, rec = Exp_Radar._lf_forecast_loss(fake, W, x, y, ci, M)
+    (mse + 0.5 * rec).backward()
+    assert torch.isfinite(mse) and torch.isfinite(rec)
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in W.repairer.parameters())
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in W.router.parameters())
+    # the gap is hidden from the repair: R = 0 there, stage 1 does not use those values
+    assert (W.last_aux['delta_u'] == W.last_aux['delta_u']).all()
+    W.eval()
+    loader = [(torch.randn(B, L, C, generator=g), torch.randn(B, H, C, generator=g), None, None,
+               torch.randint(0, CYCLE, (B,), generator=g)) for _ in range(2)]
+    fake.ordered_loader = lambda split: (None, loader)
+    Exp_Radar._calibrate_gate(fake, W, loader)
+    Exp_Radar._lf_budget_tau(fake, W)
+    se0, se1, n = 0.0, 0.0, 0
+    with torch.no_grad():
+        for bx, by, _, _, bc in loader:
+            yy = by.float()
+            se1 += ((W(bx, bc.int()) - yy) ** 2).sum().item()
+            W.force_gate_zero = True
+            se0 += ((W(bx, bc.int()) - yy) ** 2).sum().item()
+            W.force_gate_zero = False
+    assert se1 <= 1.01 * se0 + 1e-6  # the chosen gate respects the clean budget on these windows
+    a = types.SimpleNamespace(arch='v6', experts='auto', label_free=1, lf_train=1, lf_clean_budget=0.01, ckpt_tag='')
+    assert ckpt_suffix(a, 'pre') == '_lf' and ckpt_suffix(a, 'plugin') == '_lf_mf'

@@ -83,6 +83,11 @@ def ckpt_suffix(args, stage):
     arch = getattr(args, 'arch', 'v6')
     if int(getattr(args, 'label_free', 0)):
         parts.append('lf')  # trained without any injected corruption (S2 and S3 differ)
+        if stage in ('radar', 'plugin'):
+            if int(getattr(args, 'lf_train', 1)):
+                parts.append('mf')  # S3: masked-forecast training of E1 + Router
+            if float(getattr(args, 'lf_clean_budget', 0.01)) != 0.01:
+                parts.append(f'cb{float(args.lf_clean_budget):g}')
     if getattr(args, 'det_feats', 'v4') != 'v4':
         parts.append(f'det{args.det_feats}')
     ex = ','.join(resolve_experts(args))
@@ -445,6 +450,136 @@ class Exp_Radar(Exp_Main):
             l_route = torch.zeros((), device=x.device)
         return l_rec, l_route
 
+    def _lf_masks(self, B, L, C, gen=None):
+        """Random gaps on clean windows (missing data, not corruption): for half of the series one run of 1..16
+        points, at the end of the window or inside it (half each); for half of the windows the same run in every
+        channel. The values stay clean; only R is set to 0 there."""
+        dev = self.device
+        p = float(getattr(self.args, 'lf_mask_p', 0.5))
+
+        def rnd(*shape):
+            return torch.rand(*shape, device=dev, generator=gen)
+
+        lens = (rnd(B, C) * 16).long().clamp_max(15) + 1
+        lens = torch.minimum(lens, torch.full_like(lens, max(1, L // 4)))
+        tail = rnd(B, C) < 0.5
+        room = (L - lens - 8).clamp_min(1)
+        start = torch.where(tail, L - lens, (rnd(B, C) * room).long())
+        pick = rnd(B, C) < p
+        share = (rnd(B, 1) < 0.5).expand(B, C)
+        lens = torch.where(share, lens[:, :1].expand(B, C), lens)
+        start = torch.where(share, start[:, :1].expand(B, C), start)
+        pick = torch.where(share, pick[:, :1].expand(B, C), pick)
+        t = torch.arange(L, device=dev).view(1, L, 1)
+        return (t >= start.unsqueeze(1)) & (t < (start + lens).unsqueeze(1)) & pick.unsqueeze(1)
+
+    def _lf_forecast_loss(self, W, x, y, c, M):
+        """Masked forecasting: the gap M is hidden (R = 0), filled by the repair (stage 1 + E1), and the frozen
+        backbone forecasts from it; loss = forecast MSE on the windows with a gap + λ_rec · reconstruction of the gap."""
+        args = self.args
+        W.repair(x, c, compute_dep=False, need_route=False, drop_mask=M)
+        aux = W.last_aux
+        x_in = torch.where(M, aux['target'], x)
+        sel = M.flatten(1).any(dim=1)
+        y = y[:, -args.pred_len:, self.f_dim:]
+        if bool(sel.any()):
+            out = W.backbone(x_in[sel], c[sel])
+            out = out[0] if isinstance(out, (tuple, list)) else out
+            mse = F.mse_loss(out[:, -args.pred_len:, self.f_dim:], y[sel])
+        else:
+            mse = torch.zeros((), device=x.device)
+        rec = rec_loss(aux['u_hat'], x, M, args.u_clip, aux['m'], aux['s']) if bool(M.any()) else torch.zeros_like(mse)
+        return mse, rec
+
+    def _train_label_free(self, W, out_ckpt):
+        args = self.args
+        _, train_loader = self.get_data('train')
+        _, val_loader = self.ordered_loader('val')
+        params = list(W.repairer.parameters()) + list(W.router.parameters())
+        opt = optim.Adam(params, lr=args.radar_lr)
+        lam_rec = float(getattr(args, 'lam_rec', 0.5))
+        stopper = EarlyStopper(args.ft_patience, out_ckpt)
+        for epoch in range(args.ft_epochs):
+            W.set_route_temp(self._route_temp(epoch))
+            self._train_mode(freeze_backbone=True)
+            t0, logs = time.time(), []
+            for bx, by, _, _, bc in train_loader:
+                x, y, c = self._to_dev(bx, by, bc)
+                M = self._lf_masks(*x.shape)
+                opt.zero_grad()
+                mse, rec = self._lf_forecast_loss(W, x, y, c, M)
+                (mse + lam_rec * rec).backward()
+                opt.step()
+                logs.append((mse.item(), rec.item()))
+            W.eval()
+            g = torch.Generator(device=self.device).manual_seed(int(args.val_seed))
+            tot, nb = 0.0, 0
+            with torch.no_grad():
+                for bx, by, _, _, bc in val_loader:
+                    x, y, c = self._to_dev(bx, by, bc)
+                    mse, rec = self._lf_forecast_loss(W, x, y, c, self._lf_masks(*x.shape, gen=g))
+                    tot += (mse + lam_rec * rec).item()
+                    nb += 1
+            v = tot / max(nb, 1)
+            m_, r_ = np.mean(logs, axis=0)
+            print(f'[S3-lf] epoch {epoch + 1} ({time.time() - t0:.1f}s) masked-forecast mse {m_:.5f} rec {r_:.4f} '
+                  f'| val {v:.5f} T_route {W.route_temp.item():.2f}')
+            stopper(v, W)
+            if stopper.early_stop:
+                print('Early stopping')
+                break
+        W.load_state_dict(torch.load(out_ckpt, map_location=self.device))
+
+    @torch.no_grad()
+    def _lf_budget_tau(self, W):
+        """Clean-cost-constrained gate: among window-level repair rates of the clean validation windows (20% ... 0%),
+        take the largest whose clean validation MSE stays within (1 + lf_clean_budget) × the MSE without repair.
+        Uses clean data only; δ keeps the point-level run-extension threshold."""
+        args = self.args
+        budget = float(getattr(args, 'lf_clean_budget', 0.01))
+        if budget < 0:
+            return
+        W.eval()
+        _, val_loader = self.ordered_loader('val')
+        batches = []
+        for i, (bx, by, _, _, bc) in enumerate(val_loader):
+            if i >= 40:
+                break
+            x, y, c = self._to_dev(bx, by, bc)
+            batches.append((x, y[:, -args.pred_len:, self.f_dim:], c))
+
+        def val_mse():
+            se, n = 0.0, 0
+            for x, y, c in batches:
+                out = W(x, c)[:, -args.pred_len:, self.f_dim:]
+                se += ((out - y) ** 2).sum().item()
+                n += y.numel()
+            return se / max(n, 1)
+
+        seg = bool(getattr(W, 'seg_gate', False))
+        tau_pt = float(W.tau_raw) - (float(W.seg_delta) if seg else 0.0)
+        zw = torch.cat([W.gate_logit_without_tau(x, c).amax(dim=1).flatten().float() for x, _, c in batches])
+        W.force_gate_zero = True
+        base = val_mse()
+        W.force_gate_zero = False
+        chosen, tried = None, []
+        for frac in (0.20, 0.15, 0.10, 0.08, 0.05, 0.03, 0.02, 0.01, 0.005):
+            tau = torch.quantile(zw, 1.0 - frac).item()
+            W.tau_raw.data.fill_(tau)
+            if seg:
+                W.seg_delta.fill_(max(tau - tau_pt, 0.0))
+            mse = val_mse()
+            tried.append(f'{100 * frac:g}%: {100 * (mse / base - 1):+.2f}%')
+            if mse <= (1.0 + budget) * base:
+                chosen = (frac, tau)
+                break
+        if chosen is None:  # nothing fits the budget: keep the gate closed
+            W.tau_raw.data.fill_(float(zw.max()) + 1e3)
+            chosen = (0.0, float(W.tau_raw))
+        print(f'[S3-lf] clean budget {100 * budget:g}% on {len(batches)} clean val batches (base MSE {base:.5f}); '
+              f'window repair rate -> clean cost: ' + ', '.join(tried)
+              + f' => {100 * chosen[0]:g}% (τ={chosen[1]:.3f})')
+
     def _pretrain_label_free(self, out_ckpt):
         args = self.args
         W = self.model
@@ -500,12 +635,18 @@ class Exp_Radar(Exp_Main):
         for p in W.backbone.parameters():
             p.requires_grad_(not freeze_backbone)
         if getattr(W, 'label_free', False):
-            # nothing to train without corruptions: the gate is calibrated on clean training windows only
+            # no corruption anywhere: (1) masked-forecast training of E1 + Router on clean windows (optional),
+            # (2) calibration of the anchor threshold, τ and δ on clean training windows, (3) τ chosen on the clean
+            # validation windows as the most repairing value whose clean forecast cost stays within lf_clean_budget
             _, train_loader = self.get_data('train')
-            W.set_route_temp(float(getattr(args, 'route_temp_start', 1.0)))
+            if int(getattr(args, 'lf_train', 1)):
+                self._train_label_free(W, out_ckpt)
+            else:
+                W.set_route_temp(float(getattr(args, 'route_temp_start', 1.0)))
             self._calibrate_gate(W, train_loader, tag='S3-lf')
+            self._lf_budget_tau(W)
             torch.save(W.state_dict(), out_ckpt)
-            print(f'[S3-lf] saved {out_ckpt} (calibration only, no training)')
+            print(f'[S3-lf] saved {out_ckpt}')
             for p in W.parameters():
                 p.requires_grad_(True)
             return
