@@ -8,4 +8,4 @@ if [ $# -gt 0 ]; then list="$*"; else list="etth1 etth2 ettm1 ettm2 weather elec
 for ds in $list; do
   bash "$dir/$(echo "$ds" | tr '[:upper:]' '[:lower:]').sh"
 done
-python -u run_radar.py summarize --results_dir "${RESULTS_DIR:-./results_radar_v4/}"
+python -u run_radar.py summarize --results_dir "${RESULTS_DIR:-./results_radar_v5/}"

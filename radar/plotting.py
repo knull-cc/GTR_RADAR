@@ -133,7 +133,7 @@ def plot_examples(exp, fig_dir, n_examples=3, conditions=('zero_tail_k4_c100', '
             xr = aux['x_tilde'][0, :, ch].cpu().numpy()
             c2 = aux['c'][0, :, ch, 1].cpu().numpy()
             c3 = aux['c'][0, :, ch, 2].cpu().numpy()
-            a3 = aux['avail'][0, :, ch, 2].cpu().numpy()
+            a3 = aux.get('cand_avail', aux['avail'])[0, :, ch, 2].cpu().numpy()
             alpha = aux['alpha'][0, :, ch].cpu().numpy()
             pi = aux['pi'][0, :, ch, :].cpu().numpy().T  # (K, L)
             truth = y[0, -args.pred_len:, ch].cpu().numpy()
@@ -175,7 +175,7 @@ def plot_examples(exp, fig_dir, n_examples=3, conditions=('zero_tail_k4_c100', '
             ax_p.imshow(pi, aspect='auto', cmap='Greys', vmin=0, vmax=1, interpolation='nearest',
                         extent=[t_in[0] - 0.5, t_in[-1] + 0.5, pi.shape[0] - 0.5, -0.5])
             ax_p.set_yticks(range(pi.shape[0]))
-            ax_p.set_yticklabels([f'π E{i + 1}' for i in range(pi.shape[0])], fontsize=7, color=INK)
+            ax_p.set_yticklabels([f'π {n}' for n in W.expert_names], fontsize=7, color=INK)
             ax_p.set_xlabel('input time step (0 = most recent)', color=INK, fontsize=8)
             ax_p.tick_params(colors=INK, labelsize=8)
             for sp in ax_p.spines.values():

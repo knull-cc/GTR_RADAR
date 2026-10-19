@@ -2,8 +2,8 @@
 
     python diag_v4.py revin   <run_radar.py arguments>   step 1: RevIN 2×2 on B0 (needs base.pth)
     python diag_v4.py experts <run_radar.py arguments>   step 2: offline expert repair errors (no training needed;
-                                                          E1 is added when pre_v4.pth exists)
-    python diag_v4.py det     <run_radar.py arguments>   step 3: detector AUROC per condition (needs pre_v4.pth;
+                                                          E1 is added when pre_<arch>.pth exists)
+    python diag_v4.py det     <run_radar.py arguments>   step 3: detector AUROC per condition (needs pre_<arch>.pth;
                                                           --det_feats v3 evaluates the v3-feature detector)
 
 revin   For every corrupted window, four GTR (B0) forecasts:
@@ -156,7 +156,11 @@ def diag_experts(exp, conds, split):
     e3 = PeriodicShapeExpert(T, args.seq_len, args.e3_cycles).to(dev)
     med = LocalMedianExpert(3)
     names = ['no repair', 'local median', 'E2 v3 (median)', 'E2 v4 (linear)', 'E3 (periodic)', 'E3 else E2',
-             'best of E2/E3'] + (['E1 (Repairer)'] if W is not None else [])
+             'best of E2/E3']
+    e1_name = None
+    if W is not None:
+        e1_name = 'E1 refined (v5: stage 1 + residual)' if W.arch == 'v5' else 'E1 (Repairer)'
+        names.append(e1_name)
     H, fd = args.pred_len, exp.f_dim
     per = {}
     with torch.no_grad():
@@ -177,7 +181,7 @@ def diag_experts(exp, conds, split):
                 best = torch.where((c3 - x).abs() < (c2 - x).abs(), c3, c2)
                 cands['best of E2/E3'] = torch.where(a3, best, c2)
                 if W is not None:
-                    cands['E1 (Repairer)'] = W.repairer_candidate(x_p, R)
+                    cands[e1_name] = W.repairer_candidate(x_p, R)
                 _, sc = robust_stats(x)
                 sc = sc.expand_as(x)
                 yy = y[:, -H:, fd:]

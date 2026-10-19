@@ -22,9 +22,9 @@ from models import GTR as GTR_module  # noqa: E402
 from radar.dependency import hutchinson_dependency, patch_sum  # noqa: E402
 from radar.losses import (det_loss, hindsight_loss, hindsight_targets, patch_mask_to_points,  # noqa: E402
                           radar_loss, rec_loss, route_loss)
-from radar.modules import (ROUTE_FEATURES, LocalLinearExpert, PeriodicShapeExpert, ReliableNeighborExpert,  # noqa: E402
-                           from_patches, hampel_filter, point_features, reliable_context, robust_stats,
-                           shifted_windows, to_patches, to_series)
+from radar.modules import (ROUTE_FEATURES, ROUTE_FEATURES_V5, LocalLinearExpert, PeriodicShapeExpert,  # noqa: E402
+                           ReliableNeighborExpert, from_patches, hampel_filter, loo_prior, point_features,
+                           reliable_context, robust_stats, shifted_windows, to_patches, to_series)
 from radar.perturb import (MixturePerturber, apply_condition, apply_test_perturbation, condition_rng,  # noqa: E402
                            grid_conditions, parse_condition, perturb_batch, raw_zero_from_scaler)
 from radar.radar import RADARWrapper  # noqa: E402
@@ -38,7 +38,8 @@ def make_cfg(**kw):
         radar_patch=8, radar_d=64, radar_heads=4, radar_layers=2, radar_dff=128, radar_dropout=0.1,
         radar_chunk=8192, u_clip=10.0, tau_init=1.0, gate_eps=1e-2, dep_mode='grad', dep_probes=4,
         dep_probe_dist='rademacher', dep_ema=0.99, force_gate_zero=False, e2_k=3, e2_thr=0.5,
-        det_feats='v4', e3_period=24, e3_cycles=3, experts='e1,e2,e3', router='linear', route_temp_start=1.0,
+        arch='v5', det_feats='v4', e3_period=24, e3_cycles=3, experts='e1,e2,e3', router='linear',
+        route_temp_start=1.0, gate_consistency=-1,
         scale_std_frac=0.1, scale_min=1e-2,
         lam_det=0.5, lam_rec=0.5, lam_hind=0.5, lam_alpha=0.01, pos_weight=1.0, pu_neg_weight=0.1)
     for k, v in kw.items():
@@ -66,9 +67,9 @@ def make_wrapper(seed=0, **kw):
 
 
 # 1 ------------------------------------------------------------------------------------------------------
-@pytest.mark.parametrize('router', ['linear', 'h'])
-def test_output_shape_matches_backbone(router):
-    W, bb, _ = make_wrapper(router=router)
+@pytest.mark.parametrize('arch,router', [('v5', 'linear'), ('v4', 'linear'), ('v4', 'h')])
+def test_output_shape_matches_backbone(arch, router):
+    W, bb, _ = make_wrapper(arch=arch, router=router)
     x, ci = make_batch()
     with torch.no_grad():
         y_bb = bb(x, ci)
@@ -77,12 +78,23 @@ def test_output_shape_matches_backbone(router):
     aux = W.last_aux
     for k in ('logit', 'R', 'alpha', 'dbar', 'u_hat', 'x_tilde', 'target', 'gap'):
         assert aux[k].shape == (B, L, C), k
-    assert aux['pi'].shape == (B, L, C, 3) and aux['c'].shape == (B, L, C, 3) and aux['avail'].shape == (B, L, C, 3)
+    K = 2 if arch == 'v5' else 3
+    assert aux['pi'].shape == (B, L, C, K) and aux['avail'].shape == (B, L, C, K)
+    assert aux['c'].shape == (B, L, C, 3) and aux['cand_avail'].shape == (B, L, C, 3)
     assert aux['dbar_patch'].shape == (B, C, L // 8)
     assert torch.allclose(aux['pi'].sum(-1), torch.ones(B, L, C), atol=1e-5)
     assert (aux['pi'][~aux['avail']] == 0).all()
-    if router == 'linear':
-        assert aux['route_in'].shape == (B, L, C, len(ROUTE_FEATURES))
+    if arch == 'v5':
+        assert W.gate_consistency and aux['route_in'].shape == (B, L, C, len(ROUTE_FEATURES_V5))
+        # residual E1 starts as the identity on the stage-1 repair (zero-initialised head)
+        assert torch.count_nonzero(aux['delta_u']) == 0
+        c_base = (aux['pi'] * aux['c'][..., 1:]).sum(-1)
+        assert torch.allclose(aux['target'], c_base, atol=1e-5)
+        assert torch.allclose(W.repairer_candidate(x, aux['R']), c_base, atol=1e-5)
+    else:
+        assert not W.gate_consistency
+        if router == 'linear':
+            assert aux['route_in'].shape == (B, L, C, len(ROUTE_FEATURES))
 
 
 # 2 ------------------------------------------------------------------------------------------------------
@@ -295,8 +307,9 @@ def test_gradients_joint_stage_b_and_route_loss():
     for name, mod in (('ReliabilityNet', W.reliability), ('Repairer', W.repairer), ('Router', W.router)):
         for n, p in mod.named_parameters():
             assert p.grad is not None and torch.isfinite(p.grad).all(), f'{name}.{n}'
-    for p in (W.gate_a, W.gate_b, W.tau_raw):
+    for p in W.gate_scalars():
         assert p.grad is not None and torch.isfinite(p.grad).all()
+    assert len(W.gate_scalars()) == 4  # a, b, g (consistency), τ
 
     # L_route: gradients only w.r.t. the Router, non-zero, finite
     W.zero_grad(set_to_none=True)
@@ -322,19 +335,21 @@ def test_gradients_joint_stage_b_and_route_loss():
     assert all(p.grad is None for p in W.backbone.parameters())
 
 
-def test_routing_temperature_argmax_and_disabled_experts():
-    W, _, _ = make_wrapper(experts='e1,e2')
+@pytest.mark.parametrize('arch', ['v5', 'v4'])
+def test_routing_temperature_argmax_and_disabled_experts(arch):
+    e3 = 1 if arch == 'v5' else 2  # index of E3 in π
+    W, _, _ = make_wrapper(arch=arch, experts='e1,e2')
     x, ci = make_batch()
     with torch.no_grad():
         W(x, ci)
-    assert (W.last_aux['pi'][..., 2] == 0).all() and not W.last_aux['avail'][..., 2].any()
-    W2, _, _ = make_wrapper(e3_period=96)  # T >= L -> E3 unavailable everywhere
+    assert (W.last_aux['pi'][..., e3] == 0).all() and not W.last_aux['avail'][..., e3].any()
+    W2, _, _ = make_wrapper(arch=arch, e3_period=96)  # T >= L -> E3 unavailable everywhere
     with torch.no_grad():
         W2(x, ci)
-    assert (W2.last_aux['pi'][..., 2] == 0).all()
-    W3, _, _ = make_wrapper()
+    assert (W2.last_aux['pi'][..., e3] == 0).all()
+    W3, _, _ = make_wrapper(arch=arch)
     with torch.no_grad():
-        W3.router.lin.bias.copy_(torch.tensor([0.5, -0.5]))
+        W3.router.lin.bias.copy_(torch.tensor([3.0] if arch == 'v5' else [0.5, -0.5]))
         W3.set_route_temp(0.3)
         W3(x, ci)
         pi_soft = W3.last_aux['pi']
@@ -345,7 +360,41 @@ def test_routing_temperature_argmax_and_disabled_experts():
     assert torch.equal(pi_hard.sum(-1), torch.ones_like(pi_hard.sum(-1))) and set(pi_hard.unique().tolist()) <= {0., 1.}
     assert 'route_temp' in W3.state_dict() and abs(W3.state_dict()['route_temp'].item() - 0.3) < 1e-6
     coef = W3.router_coefficients()
-    assert set(coef) == {'LocalLinear', 'PeriodicShape'} and abs(coef['LocalLinear']['bias'] - 0.5) < 1e-6
+    if arch == 'v5':
+        assert set(coef) == {'PeriodicShape'} and abs(coef['PeriodicShape']['bias'] - 3.0) < 1e-6
+    else:
+        assert set(coef) == {'LocalLinear', 'PeriodicShape'} and abs(coef['LocalLinear']['bias'] - 0.5) < 1e-6
+
+
+def test_loo_prior_prefers_the_expert_that_explains_the_neighbours():
+    t = torch.arange(96.)
+    sig = torch.sin(2 * math.pi * t / 24) + 0.3 * torch.cos(4 * math.pi * t / 24) + 0.02 * t
+    x = sig.clone()
+    x[40:48] = 0.0
+    R = torch.ones(96)
+    R[40:48] = 0
+    x, R = x.view(1, 96, 1), R.view(1, 96, 1)
+    ctx = reliable_context(to_series(R) > 0.5, 3)
+    c2 = LocalLinearExpert()(x, ctx)
+    c3, a3, _ = PeriodicShapeExpert(24, 96, 3)(x, ctx, fill=c2)
+    _, s = robust_stats(x)
+    prior, ehat = loo_prior(x, ctx, c2, c3, a3, s)
+    assert prior.shape == (1, 96, 1, 2) and torch.isfinite(prior).all()
+    assert (prior[0, 40:48, 0, 1] > prior[0, 40:48, 0, 0]).all()  # periodic signal: E3 explains the neighbours
+    lin = (0.3 * t + 1.0).view(1, 96, 1)
+    ctx2 = reliable_context(to_series(torch.ones_like(lin)) > 0.5, 3)
+    c2l = LocalLinearExpert()(lin, ctx2)
+    c3l, a3l, _ = PeriodicShapeExpert(24, 96, 3)(lin, ctx2, fill=c2l)
+    prior2, _ = loo_prior(lin, ctx2, c2l, c3l, a3l, robust_stats(lin)[1])
+    assert torch.isfinite(prior2).all()
+
+
+def test_v4_checkpoint_layout_differs_from_v5():
+    W4, _, _ = make_wrapper(arch='v4')
+    W5, _, _ = make_wrapper(arch='v5')
+    k4, k5 = set(W4.state_dict()), set(W5.state_dict())
+    assert 'gate_g' in k5 and 'gate_g' not in k4
+    assert W4.repairer.body.proj.in_features == 2 * 8 and W5.repairer.body.proj.in_features == 3 * 8
 
 
 # 7 ------------------------------------------------------------------------------------------------------
@@ -399,7 +448,7 @@ def test_seq_len_not_multiple_of_patch():
     ci = torch.randint(0, CYCLE, (B,)).int()
     with torch.no_grad():
         out = W(x, ci)
-    assert out.shape == (B, H, C) and W.last_aux['pi'].shape == (B, 93, C, 3)
+    assert out.shape == (B, H, C) and W.last_aux['pi'].shape == (B, 93, C, 2) and W.last_aux['c'].shape[1] == 93
 
 
 def test_ema_profile_and_global_scale():
@@ -465,7 +514,7 @@ def test_eval_stats_and_summary(tmp_path):
     W, _, _ = make_wrapper(dep_mode='none')
     x, ci = make_batch()
     rz = np.full(C, -3.0, dtype=np.float32)
-    st_clean, st = RadarStats(3), RadarStats(3)
+    st_clean, st = RadarStats(W.n_experts, len(W.cand_names)), RadarStats(W.n_experts, len(W.cand_names))
     with torch.no_grad():
         W(x, ci)
         st_clean.update(W.last_aux, x, x, torch.zeros_like(x, dtype=torch.bool))
@@ -474,6 +523,7 @@ def test_eval_stats_and_summary(tmp_path):
         st.update(W.last_aux, x, xp, ch)
     r = st.result()
     assert r['n_changed'] == int(ch.sum()) and r['err_raw'] > 0 and len(r['pi_open_by_gap']) == 5
+    assert len(r['err_expert']) == 3 and len(r['pi_changed']) == 2 and 'delta_changed' in r
     a = hist_auroc(st.hist_pos, st_clean.hist_all)
     assert 0.0 <= a <= 1.0
     raw = tmp_path / 'raw'
@@ -483,8 +533,11 @@ def test_eval_stats_and_summary(tmp_path):
                    conditions={'clean': dict(mse=0.4, mae=0.4), 'zero_tail_k4_c100': dict(mse=0.6, mae=0.5)},
                    extras={'clean': st_clean.result(), 'zero_tail_k4_c100': dict(r, auroc=a),
                            'router_coef': W.router_coefficients(), 'experts': list(W.expert_names),
-                           'route_features': list(ROUTE_FEATURES), 'gate': W.gate_values()} if m != 'B0' else {})
+                           'candidates': list(W.cand_names), 'arch': W.arch,
+                           'route_features': list(W.route_feature_names), 'gate': W.gate_values()}
+                   if m != 'B0' else {})
         (raw / f'x__{m}.json').write_text(json.dumps(rec))
     summarize(str(tmp_path), print_tables=False)
     assert 'Zero-T' in (tmp_path / 'summary.md').read_text()
-    assert 'PeriodicShape vs Repairer' in (tmp_path / 'summary_router.md').read_text()
+    assert 'PeriodicShape vs LocalLinear' in (tmp_path / 'summary_router.md').read_text()
+    assert 'residual E1' in (tmp_path / 'summary.md').read_text()

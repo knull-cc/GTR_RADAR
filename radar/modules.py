@@ -155,15 +155,23 @@ class ReliabilityNet(nn.Module):
 
 
 class Repairer(nn.Module):
-    """Context reconstruction expert. Input per point [R_t*u_t, 1-R_t]; outputs û (M, N, P) and hidden (M, N, d)."""
+    """Context reconstruction expert E1.
 
-    def __init__(self, P, N, d_model=64, n_heads=4, n_layers=2, d_ff=128, dropout=0.1):
+    v4 (in_ch=2): input per point [R_t·u_t, 1−R_t]; output û.
+    v5 (in_ch=3, residual=True): input per point [R_t·u_t, 1−R_t, u_base_t] where u_base is the stage-1 repair
+    (E2/E3 routed); output the correction Δ, with a zero-initialised head so that E1 starts as the identity on the
+    stage-1 repair. Returns (output (M, N, P), hidden (M, N, d))."""
+
+    def __init__(self, P, N, d_model=64, n_heads=4, n_layers=2, d_ff=128, dropout=0.1, in_ch=2, residual=False):
         super().__init__()
         self.P = P
-        self.body = PatchTransformer(2 * P, N, d_model, n_heads, n_layers, d_ff, dropout)
+        self.body = PatchTransformer(in_ch * P, N, d_model, n_heads, n_layers, d_ff, dropout)
         self.head = nn.Linear(d_model, P)
+        if residual:
+            nn.init.zeros_(self.head.weight)
+            nn.init.zeros_(self.head.bias)
 
-    def forward(self, tokens):  # (M, N, 2P)
+    def forward(self, tokens):  # (M, N, in_ch·P)
         h = self.body(tokens)
         return self.head(h), h
 
@@ -376,12 +384,9 @@ def _onehot_ref(idx, n):
     return torch.nn.functional.one_hot(idx, n)[..., 1:]
 
 
-def route_features(ctx, R, c, s, avail3, spread3):
-    """Named, detached per-point routing features φ (B, L, C, len(ROUTE_FEATURES)).
-
-    ctx: reliable_context (series layout); R: (B, L, C); c: (B, L, C, 3) candidates; s: (B, 1, C) robust scale;
-    avail3 / spread3: E3 availability and template spread (B, L, C)."""
-    B, L, C = R.shape
+def _context_parts(ctx, R):
+    """Series-layout routing features shared by v4 and v5: gap / support / distance bins (reference coding) and the
+    reliable density ±4. Returns a list of (S, L, ·) float tensors."""
     dt = R.dtype
     hl, hr = ctx['has_l'], ctx['has_r']
     support = (hl & ~hr).long() * 1 + (~hl & hr).long() * 2 + (~hl & ~hr).long() * 3  # 0 = both sides
@@ -391,6 +396,17 @@ def route_features(ctx, R, c, s, avail3, spread3):
     Rs = to_series(R.detach())
     dens = torch.nn.functional.avg_pool1d(Rs.unsqueeze(1), 9, stride=1, padding=4,
                                           count_include_pad=False).squeeze(1)
+    return parts + [dens.unsqueeze(-1)]
+
+
+def route_features(ctx, R, c, s, avail3, spread3):
+    """(v4) Named, detached per-point routing features φ (B, L, C, len(ROUTE_FEATURES)).
+
+    ctx: reliable_context (series layout); R: (B, L, C); c: (B, L, C, 3) candidates; s: (B, 1, C) robust scale;
+    avail3 / spread3: E3 availability and template spread (B, L, C)."""
+    B, L, C = R.shape
+    dt = R.dtype
+    parts = _context_parts(ctx, R)
     cs = to_series(c.detach())  # (S, L, 3)
     ss = to_series(s.expand(B, L, C))  # (S, L)
     a3 = to_series(avail3).to(dt)
@@ -398,10 +414,54 @@ def route_features(ctx, R, c, s, avail3, spread3):
     d13 = torch.log1p((cs[..., 0] - cs[..., 2]).abs() / ss) * a3
     d23 = torch.log1p((cs[..., 1] - cs[..., 2]).abs() / ss) * a3
     sp = torch.log1p(to_series(spread3) / ss) * a3
-    parts += [dens.unsqueeze(-1), d12.unsqueeze(-1), d13.unsqueeze(-1), d23.unsqueeze(-1), a3.unsqueeze(-1),
-              sp.unsqueeze(-1)]
+    parts += [d12.unsqueeze(-1), d13.unsqueeze(-1), d23.unsqueeze(-1), a3.unsqueeze(-1), sp.unsqueeze(-1)]
     phi = torch.cat(parts, dim=-1)
     return from_series(phi, B, C).detach()
+
+
+ROUTE_FEATURES_V5 = ROUTE_FEATURES[:16] + ('log1p Δ(c2,c3)/s', 'E3 available', 'log1p E3 spread/s')
+
+
+def route_features_v5(ctx, R, c2, c3, s, avail3, spread3):
+    """(v5) Stage-1 routing features (E2 vs E3 only), detached: φ (B, L, C, len(ROUTE_FEATURES_V5))."""
+    B, L, C = R.shape
+    dt = R.dtype
+    parts = _context_parts(ctx, R)
+    ss = to_series(s.expand(B, L, C))
+    a3 = to_series(avail3).to(dt)
+    d23 = torch.log1p((to_series(c2.detach()) - to_series(c3.detach())).abs() / ss) * a3
+    sp = torch.log1p(to_series(spread3) / ss) * a3
+    parts += [d23.unsqueeze(-1), a3.unsqueeze(-1), sp.unsqueeze(-1)]
+    return from_series(torch.cat(parts, dim=-1), B, C).detach()
+
+
+def loo_prior(x, ctx, c2, c3, avail3, s, eps=0.05):
+    """Leave-one-out routing prior of stage 1 (v5).
+
+    E2 and E3 never use x_t to predict x_t, so at a reliable point a their outputs are leave-one-out predictions.
+    ê_k(t) = median over the k nearest reliable anchors before and after t of |c_k(a) − x(a)| / s; prior logit
+    −log(ê_k + eps). Where one expert has no finite error it gets the other's prior (neutral); none -> 0.
+    Returns (prior (B, L, C, 2) for [E2, E3], ê (B, L, C, 2)), detached."""
+    B, L, C = x.shape
+    z = to_series(x.detach())
+    ss = to_series(s.expand(B, L, C))
+    e2 = (to_series(c2.detach()) - z).abs() / ss
+    e3 = torch.where(to_series(avail3), (to_series(c3.detach()) - z).abs() / ss, torch.full_like(z, float('nan')))
+    p = torch.cat([ctx['pb'], ctx['pf']], dim=-1)  # (S, L, 2K) anchors
+    v = torch.cat([ctx['vb'], ctx['vf']], dim=-1)
+    S, _, K2 = p.shape
+    errs = []
+    for e in (e2, e3):
+        g = torch.gather(e, 1, p.reshape(S, -1)).reshape(S, L, K2)
+        g = torch.where(v, g, torch.full_like(g, float('nan')))
+        errs.append(torch.nanmedian(g, dim=-1).values)
+    ehat = torch.stack(errs, dim=-1)  # (S, L, 2)
+    pr = -torch.log(ehat + eps)
+    f2, f3 = torch.isfinite(pr[..., 0]), torch.isfinite(pr[..., 1])
+    p2 = torch.where(f2, pr[..., 0], torch.where(f3, pr[..., 1], torch.zeros_like(pr[..., 0])))
+    p3 = torch.where(f3, pr[..., 1], p2)
+    prior = torch.stack([p2, p3], dim=-1)
+    return from_series(prior, B, C), from_series(ehat, B, C)
 
 
 class LinearRouter(nn.Module):

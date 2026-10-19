@@ -25,7 +25,7 @@ import radar.compat  # noqa: F401  (np.Inf shim for utils/tools.py on numpy>=2)
 from exp.exp_main import Exp_Main
 from radar.losses import (det_loss, hindsight_loss, hindsight_targets, patch_mask_to_points, radar_loss,
                           rec_loss, route_loss)
-from radar.modules import LENGTH_BINS, ROUTE_FEATURES, hampel_filter, length_bin, robust_stats
+from radar.modules import LENGTH_BINS, hampel_filter, length_bin, robust_stats
 from radar.perturb import TEST_CONDITIONS, MixturePerturber, apply_condition, condition_rng, raw_zero_from_scaler
 from radar.radar import RADARWrapper
 from utils.tools import adjust_learning_rate
@@ -90,6 +90,9 @@ def ckpt_suffix(args, stage):
             parts.append(f'dep{args.dep_mode}')
         if float(getattr(args, 'lam_route', 0.5)) != 0.5:
             parts.append(f'lroute{float(args.lam_route):g}')
+        gc = int(getattr(args, 'gate_consistency', -1))
+        if gc >= 0 and bool(gc) != (getattr(args, 'arch', 'v5') == 'v5'):
+            parts.append(f'gc{gc}')
         if stage == 'plugin' and getattr(args, 'plugin_train', 'all') != 'all':
             parts.append(f'p{args.plugin_train}')
     if getattr(args, 'ckpt_tag', ''):
@@ -100,11 +103,13 @@ def ckpt_suffix(args, stage):
 def ckpt_paths(args):
     d = os.path.join(args.radar_ckpt_dir, setting_name(args))
     os.makedirs(d, exist_ok=True)
-    # RADAR v4 (new perturbation mixture, 5 detector features, E2 local linear + E3 periodic shape, linear Router,
-    # L_route) uses new file names, so v3 checkpoints are never loaded by mistake. base (pure GTR) is shared; the
-    # GTR+Aug control is retrained (aug_v4) because the augmentation mixture changed.
-    names = dict(base='base', aug='aug_v4', pre='pre_v4' + ckpt_suffix(args, 'pre'),
-                 radar='radar_v4' + ckpt_suffix(args, 'radar'), plugin='plugin_v4' + ckpt_suffix(args, 'plugin'))
+    # RADAR checkpoints carry the architecture (v4: three competing experts; v5: E2/E3 selection + residual E1 +
+    # consistency gate), so architectures never load each other's files. base (pure GTR) is shared; the GTR+Aug
+    # control (aug_v4) depends only on the v4 perturbation mixture and is shared by v4 and v5.
+    arch = getattr(args, 'arch', 'v5')
+    names = dict(base='base', aug='aug_v4', pre=f'pre_{arch}' + ckpt_suffix(args, 'pre'),
+                 radar=f'radar_{arch}' + ckpt_suffix(args, 'radar'),
+                 plugin=f'plugin_{arch}' + ckpt_suffix(args, 'plugin'))
     return {k: os.path.join(d, f'{v}.pth') for k, v in names.items()}
 
 
@@ -577,7 +582,7 @@ class Exp_Radar(Exp_Main):
             self._set_probe_seed(model, args.random_seed)
             se = ae = 0.0
             n, nb, t_model = 0, 0, 0.0
-            st = RadarStats(model.n_experts) if collect_extras else None
+            st = RadarStats(model.n_experts, len(model.cand_names)) if collect_extras else None
             with torch.no_grad():
                 for x, x_p, changed, y, c in self.perturbed_batches(cond, split):
                     if timing:
@@ -611,8 +616,11 @@ class Exp_Radar(Exp_Main):
             ex['tau'] = float(model.tau.item())
             ex['router'] = model.router_type
             ex['router_coef'] = model.router_coefficients()
-            ex['route_features'] = list(ROUTE_FEATURES)
+            ex['route_features'] = list(model.route_feature_names)
             ex['experts'] = list(model.expert_names)
+            ex['candidates'] = list(model.cand_names)
+            ex['arch'] = model.arch
+            ex['gate_consistency'] = bool(model.gate_consistency)
             ex['e3_period'] = int(model.e3_period)
             ex['e3_enabled'] = bool(model.periodic.enabled and bool(model.expert_enabled[2]))
             ex['det_feats'] = model.det_feats
@@ -657,16 +665,19 @@ class Exp_Radar(Exp_Main):
             if model is None:
                 print(f'[eval] {method}: checkpoint {paths[self.METHOD_CKPT[method]]} missing, skipped')
                 continue
-            print(f'[eval] {method} ({setting})')
+            # RADAR methods of a non-default architecture are recorded as e.g. 'Ours-plugin-v4', so they can sit next
+            # to the default architecture in the same results directory
+            name = method if method in ('B0', 'B1', 'B2') or args.arch == 'v5' else f'{method}-{args.arch}'
+            print(f'[eval] {name} ({setting})')
             res = self.test(model=model, preprocess=pre, conditions=tuple(conditions))
-            res.update(dict(kind='eval', version='v4', method=method, setting=setting,
+            res.update(dict(kind='eval', version='v4', arch=args.arch, method=name, setting=setting,
                             dataset=args.model_id.split('_')[0], data=args.data, backbone=args.backbone,
                             pred_len=args.pred_len, seed=args.random_seed, zero_mode=args.zero_mode,
                             grid_seed=args.grid_seed, test_grid=getattr(args, 'test_grid', 'full'),
                             dep_mode=args.dep_mode, det_feats=args.det_feats, router=args.router,
                             experts=args.experts, ckpt=os.path.basename(paths[self.METHOD_CKPT[method]]),
                             n_params=sum(p.numel() for p in model.parameters())))
-            results[method] = res
+            results[name] = res
             del model
             torch.cuda.empty_cache() if torch.cuda.is_available() else None
         if 'B0' in results:
@@ -705,18 +716,22 @@ class RadarStats:
     where the gate opens, also per gap-length bin), repair errors on the changed points in robust units of the clean
     window (|z − x_clean| / s_clean for z = corrupted input, routed target, repaired input, each expert) and the
     ℓ histograms for the detection AUROC (positives = changed points; negatives = all points of the clean condition).
+    v5 extras: |Δ| of the residual E1 (robust units) and the stage-1 log-odds of E3 vs E2 split into the
+    leave-one-out prior and the learned correction, on changed points and where the gate opens.
+    K: number of routed experts (π); Kc: number of candidates in aux['c'] (default K).
     """
 
-    def __init__(self, K):
+    def __init__(self, K, Kc=None):
         self.K = K
+        self.Kc = K if Kc is None else Kc
         self.s = defaultdict(float)
         self.pi_all = np.zeros(K)
         self.pi_changed = np.zeros(K)
         self.pi_open = np.zeros(K)
         self.pi_open_gap = np.zeros((len(LENGTH_BINS), K))
         self.n_open_gap = np.zeros(len(LENGTH_BINS))
-        self.err_exp = np.zeros(K)
-        self.n_exp = np.zeros(K)
+        self.err_exp = np.zeros(self.Kc)
+        self.n_exp = np.zeros(self.Kc)
         self.dbar = None
         self.hist_all = np.zeros(HIST_BINS)
         self.hist_pos = np.zeros(HIST_BINS)
@@ -753,8 +768,8 @@ class RadarStats:
         s['err_raw'] += err(x_p)
         s['err_target'] += err(aux['target'])
         s['err_tilde'] += err(aux['x_tilde'])
-        c, avail = aux['c'], aux['avail']
-        for k in range(self.K):
+        c, avail = aux['c'], aux.get('cand_avail', aux['avail'])
+        for k in range(self.Kc):
             mk = changed & avail[..., k]
             self.n_exp[k] += mk.sum().item()
             self.err_exp[k] += ((c[..., k] - x_clean).abs() / sc)[mk].sum().item()
@@ -765,6 +780,14 @@ class RadarStats:
         pio = pi[open_]  # (n_open, K)
         self.pi_open += self._np(pio.sum(dim=0))
         self.pi_changed += self._np(pi[changed].sum(dim=0))
+        if 'delta_u' in aux:
+            d = aux['delta_u'].abs()
+            s['d_changed'] += d[changed].sum().item()
+            s['d_open'] += d[open_].sum().item()
+            s['lo_prior_open'] += aux['route_lo_prior'][open_].sum().item()
+            s['lo_corr_open'] += aux['route_lo_corr'][open_].sum().item()
+            s['lo_prior_changed'] += aux['route_lo_prior'][changed].sum().item()
+            s['lo_corr_changed'] += aux['route_lo_corr'][changed].sum().item()
         gb = length_bin(aux['gap'])[open_]
         for b in range(len(LENGTH_BINS)):
             sel = gb == b
@@ -792,8 +815,8 @@ class RadarStats:
                 gate_recall=div(n_open, n_ch),
                 err_raw=div(s['err_raw'], n_ch), err_target=div(s['err_target'], n_ch),
                 err_tilde=div(s['err_tilde'], n_ch),
-                err_expert=[div(self.err_exp[k], self.n_exp[k]) for k in range(self.K)],
-                avail_expert=[div(self.n_exp[k], n_ch) for k in range(self.K)],
+                err_expert=[div(self.err_exp[k], self.n_exp[k]) for k in range(self.Kc)],
+                avail_expert=[div(self.n_exp[k], n_ch) for k in range(self.Kc)],
                 pi_changed=(self.pi_changed / n_ch).tolist(),
                 n_open=int(n_open),
                 pi_open=(self.pi_open / n_open).tolist() if n_open else [nan] * self.K,
@@ -801,4 +824,10 @@ class RadarStats:
                 pi_open_by_gap={LENGTH_BINS[b]: ((self.pi_open_gap[b] / self.n_open_gap[b]).tolist()
                                                  if self.n_open_gap[b] else [nan] * self.K)
                                 for b in range(len(LENGTH_BINS))})
+            if 'd_changed' in s:
+                out.update(delta_changed=div(s['d_changed'], n_ch), delta_open=div(s['d_open'], n_open),
+                           logodds_prior_changed=div(s['lo_prior_changed'], n_ch),
+                           logodds_corr_changed=div(s['lo_corr_changed'], n_ch),
+                           logodds_prior_open=div(s['lo_prior_open'], n_open),
+                           logodds_corr_open=div(s['lo_corr_open'], n_open))
         return out

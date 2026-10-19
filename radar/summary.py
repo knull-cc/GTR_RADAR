@@ -79,7 +79,11 @@ def _table(md, header, rows):
     md.append('')
 
 
-def summarize(results_dir='./results_radar_v4/', print_tables=True, **_):
+def _label(m):
+    return METHOD_LABEL.get(m, m)
+
+
+def summarize(results_dir='./results_radar_v5/', print_tables=True, **_):
     raw_dir = os.path.join(results_dir, 'raw')
     evals, repro = load(raw_dir)
     if not evals:
@@ -91,7 +95,7 @@ def summarize(results_dir='./results_radar_v4/', print_tables=True, **_):
     extras = defaultdict(dict)  # (ds, H, method) -> {seed: record}
     spec = {}
     for r in evals:
-        if r['method'] not in ALL_METHODS:
+        if r['method'] not in ALL_METHODS and not str(r['method']).startswith('Ours'):
             continue
         key = (r['dataset'], r['pred_len'], r['method'])
         for cond, v in r['conditions'].items():
@@ -104,7 +108,8 @@ def summarize(results_dir='./results_radar_v4/', print_tables=True, **_):
     cm = {k: (_mean([v[0] for v in d.values()]), _mean([v[1] for v in d.values()]), sorted(d))
           for k, d in cond_tab.items()}
     dsh = sorted({(k[0], k[1]) for k in cm}, key=lambda k: (_ds_key(k[0]), k[1]))
-    methods = [m for m in ALL_METHODS if any(k[2] == m for k in cm)]
+    present = {k[2] for k in cm}
+    methods = [m for m in ALL_METHODS if m in present] + sorted(m for m in present if m not in ALL_METHODS)
     main = [m for m in MAIN_METHODS if m in methods]
 
     def conds_of(ds, H, m):
@@ -169,7 +174,7 @@ def summarize(results_dir='./results_radar_v4/', print_tables=True, **_):
                         return fn(H)
                     if H != rows_avg_key and not conds_of(ds, H, m):
                         continue
-                    row = [ds, str(H), METHOD_LABEL[m]]
+                    row = [ds, str(H), _label(m)]
                     if with_clean:
                         row.append(_f(val(lambda h: clean_val(ds, h, m, idx))))
                     row += [_f(val(lambda h, g=g: group_val(ds, h, m, g, idx))) for g in groups]
@@ -185,7 +190,7 @@ def summarize(results_dir='./results_radar_v4/', print_tables=True, **_):
             md.append(f'### {metric} — OOD (type never used in training)')
             _table(md, ['Dataset', 'H', 'Method'] + [_gl(g) for g in ood_groups],
                    table_rows(main, ood_groups, idx, with_clean=False))
-        extra = [m for m in EXTRA_METHODS if m in methods]
+        extra = [m for m in methods if m not in MAIN_METHODS]
         if extra:
             md.append(f'### {metric} — additional RADAR variants')
             _table(md, ['Dataset', 'H', 'Method', 'Clean'] + [_gl(g) for g in main_groups + ood_groups],
@@ -227,9 +232,9 @@ def summarize(results_dir='./results_radar_v4/', print_tables=True, **_):
         return float(np.average(np.asarray(vals, dtype=np.float64), axis=0, weights=ws)) \
             if np.ndim(vals[0]) == 0 else np.average(np.asarray(vals, dtype=np.float64), axis=0, weights=ws)
 
-    rad = [m for m in RADAR_METHODS if m in methods]
+    rad = [m for m in methods if m in RADAR_METHODS or (m.startswith('Ours') and m not in RADAR_METHODS)]
     for m in rad:
-        md.append(f'### {METHOD_LABEL[m]} — detection AUROC (positives = corrupted points, negatives = clean points)')
+        md.append(f'### {_label(m)} — detection AUROC (positives = corrupted points, negatives = clean points)')
         rows = []
         for ds, H in dsh:
             rs = list(extras.get((ds, H, m), {}).values())
@@ -237,8 +242,8 @@ def summarize(results_dir='./results_radar_v4/', print_tables=True, **_):
                 rows.append([ds, str(H)] + [_f(ex_group(rs, g, 'auroc'), 3) for g in main_groups + ood_groups])
         _table(md, ['Dataset', 'H'] + [_gl(g) for g in main_groups + ood_groups], rows)
 
-        md.append(f'### {METHOD_LABEL[m]} — gate recall (α>0.5 on corrupted points) / false repair on Clean '
-                  f'(α>0.5 on clean points), a, b, τ')
+        md.append(f'### {_label(m)} — gate recall (α>0.5 on corrupted points) / false repair on Clean '
+                  f'(α>0.5 on clean points), gate scalars')
         rows = []
         for ds, H in dsh:
             rs = list(extras.get((ds, H, m), {}).values())
@@ -248,12 +253,12 @@ def summarize(results_dir='./results_radar_v4/', print_tables=True, **_):
             gv = rs[0]['extras'].get('gate', {})
             rows.append([ds, str(H), f'{100 * fr:.2f}%' if fr == fr else '–']
                         + [_f(ex_group(rs, g, 'gate_recall'), 3) for g in main_groups + ood_groups]
-                        + [_f(gv.get('a'), 2), _f(gv.get('b'), 2), _f(gv.get('tau'), 2),
+                        + [_f(gv.get('a'), 2), _f(gv.get('b'), 2), _f(gv.get('g'), 2), _f(gv.get('tau'), 2),
                            _f(_mean([r.get('time_ratio_vs_B0') for r in rs]), 2)])
         _table(md, ['Dataset', 'H', 'false repair'] + [_gl(g) for g in main_groups + ood_groups]
-               + ['softplus(a)', 'softplus(b)', 'τ', 'time ×B0'], rows)
+               + ['softplus(a)', 'softplus(b)', 'softplus(g)', 'τ', 'time ×B0'], rows)
 
-        md.append(f'### {METHOD_LABEL[m]} — repair error on corrupted points |z − x_clean| / s_clean '
+        md.append(f'### {_label(m)} — repair error on corrupted points |z − x_clean| / s_clean '
                   f'(raw input → routed target → repaired input x̃)')
         rows = []
         for ds, H in dsh:
@@ -267,7 +272,47 @@ def summarize(results_dir='./results_radar_v4/', print_tables=True, **_):
             rows.append(row)
         _table(md, ['Dataset', 'H'] + [_gl(g) for g in main_groups + ood_groups], rows)
 
-        md.append(f'### {METHOD_LABEL[m]} — π at open gates (α>0.5 on corrupted points), E1 / E2 / E3')
+        cands = None
+        for ds, H in dsh:
+            for r in extras.get((ds, H, m), {}).values():
+                cands = cands or r['extras'].get('candidates') or r['extras'].get('experts')
+        md.append(f'### {_label(m)} — repair error of each candidate on corrupted points '
+                  f'({" / ".join(cands or ["E1", "E2", "E3"])}; E3 only where available)')
+        rows = []
+        for ds, H in dsh:
+            rs = list(extras.get((ds, H, m), {}).values())
+            if not rs:
+                continue
+            row = [ds, str(H)]
+            for g in main_groups + ood_groups:
+                v = ex_group(rs, g, 'err_expert')
+                row.append('–' if np.ndim(v) == 0 else '/'.join(_f(x, 2) for x in v))
+            rows.append(row)
+        _table(md, ['Dataset', 'H'] + [_gl(g) for g in main_groups + ood_groups], rows)
+
+        if any('delta_changed' in e for r in sum((list(extras.get((d, h, m), {}).values()) for d, h in dsh), [])
+               for e in r['extras'].values() if isinstance(e, dict)):
+            md.append(f'### {_label(m)} — residual E1 mean abs(Δ) in robust units (changed points / open gates) ; '
+                      f'stage-1 log-odds E3 vs E2 at open gates (leave-one-out prior + learned correction)')
+            rows = []
+            for ds, H in dsh:
+                rs = list(extras.get((ds, H, m), {}).values())
+                if not rs:
+                    continue
+                row = [ds, str(H)]
+                for g in main_groups + ood_groups:
+                    row.append(f"{_f(ex_group(rs, g, 'delta_changed'), 2)} / {_f(ex_group(rs, g, 'delta_open'), 2)}"
+                               f" ; {_f(ex_group(rs, g, 'logodds_prior_open', weight='n_open'), 2)} + "
+                               f"{_f(ex_group(rs, g, 'logodds_corr_open', weight='n_open'), 2)}")
+                rows.append(row)
+            _table(md, ['Dataset', 'H'] + [_gl(g) for g in main_groups + ood_groups], rows)
+
+        names = None
+        for ds, H in dsh:
+            for r in extras.get((ds, H, m), {}).values():
+                names = names or r['extras'].get('experts')
+        md.append(f'### {_label(m)} — π at open gates (α>0.5 on corrupted points), '
+                  f'{" / ".join(names or ["E1", "E2", "E3"])}')
         rows = []
         for ds, H in dsh:
             rs = list(extras.get((ds, H, m), {}).values())
@@ -299,14 +344,14 @@ def summarize(results_dir='./results_radar_v4/', print_tables=True, **_):
     for idx, metric in ((0, 'MSE'), (1, 'MAE')):
         ap.append(f'### {metric} by length k (mean over channel ratios)')
         hdr = ['Dataset', 'H', 'Method'] + [f'{_gl((t, p))} k{k}' for t, p, k in lengths]
-        rows = [[ds, str(H), METHOD_LABEL[m]] + [_f(group_val(ds, H, m, (t, p), idx, k=k)) for t, p, k in lengths]
+        rows = [[ds, str(H), _label(m)] + [_f(group_val(ds, H, m, (t, p), idx, k=k)) for t, p, k in lengths]
                 for ds, H in dsh for m in methods if conds_of(ds, H, m)]
         _table(ap, hdr, rows)
         if len(ratios) > 1:
             ap.append(f'### {metric} by channel ratio (mean over lengths)')
             gr = [(g, c) for g in main_groups + ood_groups for c in ratios]
             hdr = ['Dataset', 'H', 'Method'] + [f'{_gl(g)} c{c}' for g, c in gr]
-            rows = [[ds, str(H), METHOD_LABEL[m]] + [_f(group_val(ds, H, m, g, idx, ratio=c)) for g, c in gr]
+            rows = [[ds, str(H), _label(m)] + [_f(group_val(ds, H, m, g, idx, ratio=c)) for g, c in gr]
                     for ds, H in dsh for m in methods if conds_of(ds, H, m)]
             _table(ap, hdr, rows)
     with open(os.path.join(results_dir, 'summary_appendix.md'), 'w') as f:
@@ -322,14 +367,15 @@ def summarize(results_dir='./results_radar_v4/', print_tables=True, **_):
             ex0 = rs[0]['extras']
             coef = ex0.get('router_coef')
             names = ex0.get('experts', ['E1', 'E2', 'E3'])
-            rt.append(f'### {ds} H={H} {METHOD_LABEL[m]} — router {ex0.get("router")}, E3 period '
+            rt.append(f'### {ds} H={H} {_label(m)} — router {ex0.get("router")}, E3 period '
                       f'{ex0.get("e3_period")} ({"available" if ex0.get("e3_enabled") else "unavailable"}), '
                       f'T_route {_f(ex0.get("gate", {}).get("route_temp"), 2)}')
             if coef:
                 feats = ['bias'] + list(ex0.get('route_features', []))
                 exps = list(coef.keys())
-                rt.append('Coefficients = log-odds of the expert instead of E1 (Repairer), relative to the reference '
-                          'bins (gap 0, both sides reliable, distance 0).')
+                extra = (' They are added to the leave-one-out prior −log ê_k.' if ex0.get('arch') == 'v5' else '')
+                rt.append(f'Coefficients = learned log-odds of the expert instead of {names[0]}, relative to the '
+                          f'reference bins (gap 0, both sides reliable, distance 0).{extra}')
                 _table(rt, ['feature'] + [f'{e} vs {names[0]}' for e in exps],
                        [[ft] + [_f(coef[e].get(ft), 3) for e in exps] for ft in feats])
             bins = None

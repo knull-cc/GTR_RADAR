@@ -1,14 +1,18 @@
-"""RADARWrapper (v4): dependency-aware input repair placed *before* the backbone (and thus before its RevIN).
+"""RADARWrapper: dependency-aware input repair placed *before* the backbone (and thus before its RevIN).
 
-    x ─ RobustScaler (floored) ─┬─ ReliabilityNet(5 point features) → ℓ, R = 1 − σ(ℓ)      ┐ stage A: backbone-agnostic,
-                                ├─ E1 Repairer (R-weighted context)                          │ trained once per dataset
-                                ├─ E2 local linear (reliable neighbours, interpolation)      │ (L_det PU + L_rec)
-                                └─ E3 periodic shape (same-phase template + residual interp) ┘ E2/E3 parameter-free
-         Router(π): linear on named per-point features φ (gap length, support, distances, density, disagreements)
-                    → candidate repair c = Σ_k π_k c_k   (unavailable experts masked, softmax temperature annealed)
-    D̃ = D_p / D̄   (EMA profile of this backbone, per-sample Hutchinson gradient, or none)     ┐ stage B: per backbone
-    α = σ( softplus(a)·logit(1−R) + softplus(b)·log(D̃ + ε) − τ )                               ┘
-    x̃ = x + α (c − x)  →  backbone closure f(x̃) = backbone(x̃, *args)
+v5 (default, `--arch v5`): select, then refine
+    x ─ RobustScaler ─┬─ ReliabilityNet(5 point features) → ℓ, R = 1 − σ(ℓ)                       stage A (S2)
+                      ├─ stage 1  E2 local linear | E3 periodic shape  (parameter-free)
+                      │           π = softmax( −log ê_k  +  wᵀφ )      ê_k: leave-one-out error of expert k on the
+                      │           c_base = π_2 c_2 + π_3 c_3            nearest reliable points; wᵀφ: learned (Router)
+                      └─ stage 2  E1 residual Repairer([R·u, 1−R, u_base]) → Δ (zero-initialised)
+                                  c = c_base + Δ·s
+    α = σ( softplus(a)·ℓ + softplus(b)·log(D̃ + ε) + softplus(g)·log(1 + |c − x|/s) − τ )      stage B (S3)
+    x̃ = x + α (c − x)  →  backbone(x̃, *args)
+v4 (`--arch v4`): E1 is a third competing expert, π = softmax(wᵀφ) over {E1, E2, E3}, no consistency term.
+
+The Router (w) only ever receives forecast-loss gradients: the forecast MSE through c_base and L_route. The
+reconstruction loss sees u_base detached, and the gate sees c detached.
 """
 import math
 
@@ -18,9 +22,10 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from radar.dependency import DependencyProfile, hutchinson_dependency, patch_sum
-from radar.modules import (N_POINT_FEATURES, ROUTE_FEATURES, LinearRouter, LocalLinearExpert, PeriodicShapeExpert,
-                           ReliabilityNet, Repairer, Router, from_patches, from_series, patch_to_points,
-                           point_features, reliable_context, robust_stats, route_features, to_patches, to_series)
+from radar.modules import (N_POINT_FEATURES, ROUTE_FEATURES, ROUTE_FEATURES_V5, LinearRouter, LocalLinearExpert,
+                           PeriodicShapeExpert, ReliabilityNet, Repairer, Router, from_patches, from_series,
+                           loo_prior, patch_to_points, point_features, reliable_context, robust_stats,
+                           route_features, route_features_v5, to_patches, to_series)
 
 EXPERTS = ('Repairer', 'LocalLinear', 'PeriodicShape')
 EXPERT_KEYS = ('e1', 'e2', 'e3')
@@ -44,6 +49,12 @@ def resolve_e3_period(cfg):
     return int(_cfg(cfg, 'cycle', 0)) if p < 0 else p
 
 
+def resolve_gate_consistency(cfg):
+    """--gate_consistency: 1 / 0, or -1 (default) = on for v5, off for v4."""
+    gc = int(_cfg(cfg, 'gate_consistency', -1))
+    return (str(_cfg(cfg, 'arch', 'v5')) == 'v5') if gc < 0 else bool(gc)
+
+
 class RADARWrapper(nn.Module):
     def __init__(self, backbone, cfg):
         super().__init__()
@@ -53,6 +64,9 @@ class RADARWrapper(nn.Module):
         self.P = int(_cfg(cfg, 'radar_patch', 8))
         self.N = math.ceil(self.seq_len / self.P)
         self.pad = self.N * self.P - self.seq_len
+        self.arch = str(_cfg(cfg, 'arch', 'v5'))
+        assert self.arch in ('v4', 'v5'), self.arch
+        v5 = self.arch == 'v5'
 
         d = int(_cfg(cfg, 'radar_d', 64))
         heads = int(_cfg(cfg, 'radar_heads', 4))
@@ -65,7 +79,7 @@ class RADARWrapper(nn.Module):
         self.n_point_feats = N_POINT_FEATURES[self.det_feats]
         self.reliability = ReliabilityNet(self.P, self.N, d, heads, layers, d_ff, drop, head_bias=-4.0,
                                           n_feat=self.n_point_feats)
-        self.repairer = Repairer(self.P, self.N, d, heads, layers, d_ff, drop)
+        self.repairer = Repairer(self.P, self.N, d, heads, layers, d_ff, drop, in_ch=3 if v5 else 2, residual=v5)
         self.e2_k = int(_cfg(cfg, 'e2_k', 3))
         self.e2_thr = float(_cfg(cfg, 'e2_thr', 0.5))
         self.neighbor = LocalLinearExpert()
@@ -76,24 +90,36 @@ class RADARWrapper(nn.Module):
         self.u_clip = float(_cfg(cfg, 'u_clip', 10.0))
 
         # ---- experts / Router
-        self.expert_names = EXPERTS
-        self.n_experts = len(EXPERTS)
         keys = [k.strip().lower() for k in str(_cfg(cfg, 'experts', 'e1,e2,e3')).split(',') if k.strip()]
         assert 'e1' in keys and set(keys) <= set(EXPERT_KEYS), f'--experts must contain e1, got {keys}'
+        if v5:
+            assert 'e2' in keys, 'v5 routes between E2 and E3: --experts must contain e2'
         self.register_buffer('expert_enabled', torch.tensor([k in keys for k in EXPERT_KEYS]), persistent=False)
         self.router_type = str(_cfg(cfg, 'router', 'linear'))
         assert self.router_type in ('linear', 'h'), self.router_type
-        if self.router_type == 'linear':
-            self.router = LinearRouter(len(ROUTE_FEATURES), self.n_experts)
+        if v5:
+            assert self.router_type == 'linear', 'v5 uses the linear stage-1 Router'
+            self.expert_names = ('LocalLinear', 'PeriodicShape')  # routed experts (π)
+            self.cand_names = ('Refined', 'LocalLinear', 'PeriodicShape')  # c[..., k]: final, E2, E3
+            self.route_feature_names = ROUTE_FEATURES_V5
+            self.router = LinearRouter(len(ROUTE_FEATURES_V5), 2)
         else:
-            self.router = Router(d, self.P, self.n_experts)
+            self.expert_names = EXPERTS
+            self.cand_names = EXPERTS
+            self.route_feature_names = ROUTE_FEATURES
+            self.router = (LinearRouter(len(ROUTE_FEATURES), 3) if self.router_type == 'linear'
+                           else Router(d, self.P, 3))
+        self.n_experts = len(self.expert_names)
         self.register_buffer('route_temp', torch.tensor(float(_cfg(cfg, 'route_temp_start', 1.0))))
         self.route_hard = False  # argmax routing (evaluation only)
 
-        # ---- stage B gate (a, b, τ)
+        # ---- stage B gate (a, b, [g], τ)
         # softplus(a) = 4 makes the gate close to a switch in the unreliability logit (v1's effective slope was 20)
         self.gate_a = nn.Parameter(torch.tensor(_inv_softplus(float(_cfg(cfg, 'gate_a_init', 4.0)))))
         self.gate_b = nn.Parameter(torch.tensor(_inv_softplus(float(_cfg(cfg, 'gate_b_init', 1.0)))))
+        self.gate_consistency = resolve_gate_consistency(cfg)
+        if self.gate_consistency:
+            self.gate_g = nn.Parameter(torch.tensor(_inv_softplus(float(_cfg(cfg, 'gate_g_init', 1.0)))))
         self.tau_raw = nn.Parameter(torch.tensor(float(_cfg(cfg, 'tau_init', 1.0))))
         self.gate_eps = float(_cfg(cfg, 'gate_eps', 1e-2))
         self.logit_clip = 12.0
@@ -118,15 +144,19 @@ class RADARWrapper(nn.Module):
         return self.tau_raw
 
     def gate_parameters(self):
-        """Stage B: Router + gate (a, b, τ)."""
+        """Stage B: Router + gate scalars."""
         return list(self.router.parameters()) + self.gate_scalars()
 
     def gate_scalars(self):
-        return [self.gate_a, self.gate_b, self.tau_raw]
+        g = [self.gate_g] if self.gate_consistency else []
+        return [self.gate_a, self.gate_b] + g + [self.tau_raw]
 
     def gate_values(self):
-        return dict(a=float(F.softplus(self.gate_a)), b=float(F.softplus(self.gate_b)), tau=float(self.tau_raw),
-                    route_temp=float(self.route_temp))
+        out = dict(a=float(F.softplus(self.gate_a)), b=float(F.softplus(self.gate_b)), tau=float(self.tau_raw),
+                   route_temp=float(self.route_temp))
+        if self.gate_consistency:
+            out['g'] = float(F.softplus(self.gate_g))
+        return out
 
     def set_route_temp(self, value):
         self.route_temp.fill_(float(value))
@@ -143,7 +173,7 @@ class RADARWrapper(nn.Module):
 
     @torch.no_grad()
     def gate_logit_without_tau(self, x, *bb_args):
-        """softplus(a)·logit(1−R) + softplus(b)·log(D̃+ε) for every point (used to calibrate τ)."""
+        """Gate logit + τ for every point (used to calibrate τ)."""
         _, aux = self.repair(x, *bb_args)
         return aux['gate_logit'] + self.tau_raw if not self.force_gate_zero else None
 
@@ -159,7 +189,7 @@ class RADARWrapper(nn.Module):
     def router_coefficients(self):
         if self.router_type != 'linear':
             return None
-        return self.router.coefficients(self.expert_names)
+        return self.router.coefficients(self.expert_names, self.route_feature_names)
 
     # ------------------------------------------------------------------ helpers
     def _run(self, fn, inp):
@@ -206,58 +236,93 @@ class RADARWrapper(nn.Module):
             Dt = Dp / scale
         return Dt.detach()
 
-    def candidates(self, x, R, c1, s, h=None):
-        """Expert candidates c (B, L, C, K), availability (bool, B, L, C, K), Router input and the reliable context.
-        R is detached here (E2/E3/features only read the reliable mask R > e2_thr and R itself as a feature)."""
-        B, L, C = x.shape
+    def _param_free(self, x, R):
+        """E2 / E3 candidates and the reliable context for reliability R (detached)."""
         ctx = reliable_context(to_series(R.detach()) > self.e2_thr, self.e2_k)
         c2 = self.neighbor(x, ctx)
         c3, a3, spread3 = self.periodic(x, ctx, fill=c2)
         a3 = a3 & self.expert_enabled[2]
         c3 = torch.where(a3, c3, c2)
-        cand = torch.stack([c1, c2, c3], dim=-1)
-        ones = torch.ones_like(a3)
-        avail = torch.stack([ones, ones & self.expert_enabled[1], a3], dim=-1)
-        if self.router_type == 'linear':
-            route_in = route_features(ctx, R, cand, s, a3, spread3)
-        else:
-            route_in = h
-        return cand, avail, route_in, ctx
+        return ctx, c2, c3, a3, spread3
 
-    def route(self, route_in, avail, B, C, pad):
-        """π (B, L, C, K) from the Router input; unavailable experts get probability 0."""
-        if self.router_type == 'linear':
-            logits = self.router(route_in)
-        else:
-            logits = from_patches(self._run(self.router, route_in), B, C, pad)
+    def _softmax_route(self, logits, avail):
         logits = logits / self.route_temp.clamp_min(1e-3)
         logits = logits.masked_fill(~avail, float('-inf'))
         if self.route_hard:
             return F.one_hot(logits.argmax(dim=-1), logits.shape[-1]).to(logits.dtype)
         return torch.softmax(logits, dim=-1)
 
+    # ---- v5 stage 1
+    def stage1(self, x, R, s):
+        """Stage 1 (v5): E2 / E3 and π = softmax(−log ê + wᵀφ). Returns a dict (c_base keeps the Router gradient)."""
+        ctx, c2, c3, a3, spread3 = self._param_free(x, R)
+        prior, ehat = loo_prior(x, ctx, c2, c3, a3, s)
+        phi = route_features_v5(ctx, R, c2, c3, s, a3, spread3)
+        avail = torch.stack([torch.ones_like(a3), a3], dim=-1)
+        corr = self.router(phi)  # (B, L, C, 2), E2 = reference (0)
+        pi = self._softmax_route(prior + corr, avail)
+        c_base = pi[..., 0] * c2 + pi[..., 1] * c3
+        return dict(ctx=ctx, c2=c2, c3=c3, a3=a3, prior=prior, ehat=ehat, phi=phi, corr=corr, avail=avail, pi=pi,
+                    c_base=c_base)
+
+    # ---- v4 routing
+    def _route_v4(self, route_in, avail, B, C, pad):
+        if self.router_type == 'linear':
+            logits = self.router(route_in)
+        else:
+            logits = from_patches(self._run(self.router, route_in), B, C, pad)
+        return self._softmax_route(logits, avail)
+
+    def route_candidate(self, aux):
+        """Routed repair value recomputed with gradients reaching the Router only (used by L_route):
+        v5: Σ_k π_k sg(c_k) + sg(Δ·s);  v4: Σ_k π_k sg(c_k)."""
+        if self.arch == 'v5':
+            pi = self._softmax_route(aux['route_prior'] + self.router(aux['route_in'].detach()), aux['avail'])
+            cand = aux['c'][..., 1:].detach()
+            return (pi * cand).sum(dim=-1) + aux['delta_x'].detach()
+        pi = self._route_v4(aux['route_in'].detach(), aux['avail'], aux['B'], aux['C'], aux['pad'])
+        return (pi * aux['c'].detach()).sum(dim=-1)
+
     def route_probs(self, aux):
-        """π recomputed from the *detached* Router input of a previous repair() call (gradients reach the Router
-        only; used by L_route)."""
-        return self.route(aux['route_in'].detach(), aux['avail'], aux['B'], aux['C'], aux['pad'])
+        """(kept for compatibility) π recomputed from the detached Router input."""
+        if self.arch == 'v5':
+            return self._softmax_route(aux['route_prior'] + self.router(aux['route_in'].detach()), aux['avail'])
+        return self._route_v4(aux['route_in'].detach(), aux['avail'], aux['B'], aux['C'], aux['pad'])
+
+    def _e1(self, Rp, up, u_base=None):
+        """E1 forward on patch layout. Rp, up: (BC, N, P). v4: returns (û, h); v5 (u_base (B, L, C), the detached
+        stage-1 repair in robust units): returns (Δ, h)."""
+        BC = up.shape[0]
+        chans = [Rp * up, 1.0 - Rp]
+        if u_base is not None:
+            ub_p, _ = to_patches(u_base, self.P)
+            chans.append(ub_p)
+        tokens = torch.stack(chans, dim=-1).reshape(BC, self.N, len(chans) * self.P)
+        return self._run(self.repairer, tokens)
 
     @torch.no_grad()
     def repairer_candidate(self, x, R):
-        """E1 candidate c1 for a *given* reliability R (B, L, C) — e.g. the oracle R = 1 − mask in diag_v4.py."""
+        """E1 candidate for a *given* reliability R (B, L, C) — e.g. the oracle R = 1 − mask in diag_v4.py.
+        v5: the refined repair c_base + Δ·s (stage 1 run with the same R)."""
         B, L, C = x.shape
         m, s = robust_stats(x, std_frac=self.std_frac, s_min=self.s_min)
         uc = ((x - m) / s).clamp(-self.u_clip, self.u_clip)
         up, pad = to_patches(uc, self.P)
-        Rp, _ = to_patches(R.to(x.dtype), self.P)
-        tokens = torch.stack([Rp * up, 1.0 - Rp], dim=-1).reshape(up.shape[0], self.N, 2 * self.P)
-        u_hat_p, _ = self._run(self.repairer, tokens)
+        R = R.to(x.dtype)
+        Rp, _ = to_patches(R, self.P)
+        if self.arch == 'v5':
+            st = self.stage1(x, R, s)
+            u_base = ((st['c_base'] - m) / s).clamp(-self.u_clip, self.u_clip)
+            delta_p, _ = self._e1(Rp, up, u_base)
+            return st['c_base'] + from_patches(delta_p, B, C, pad) * s
+        u_hat_p, _ = self._e1(Rp, up)
         return from_patches(u_hat_p, B, C, pad) * s + m
 
     # ------------------------------------------------------------------ forward
     def repair(self, x, *bb_args, rec_mask=None, compute_dep=True, need_route=True):
         """Returns x̃ and the aux dict. rec_mask: optional bool (B*C, N) of patches whose R is forced to 0
-        in the Repairer input (masked-reconstruction training). need_route=False skips E2/E3/Router/gate
-        (stage-A training only needs ℓ and û)."""
+        (masked-reconstruction training; in v5 those patches are also unreliable for stage 1). need_route=False
+        skips the dependency and the gate (stage-A training only needs ℓ and û; v4 also skips E2/E3/Router)."""
         B, L, C = x.shape
         f = self._closure(bb_args)
 
@@ -270,28 +335,52 @@ class RADARWrapper(nn.Module):
         feats = point_features(up.reshape(BC, -1), self.det_feats).reshape(BC, self.N, self.P * self.n_point_feats)
         logit_p = self._run(self.reliability, feats)  # unreliability logit ℓ = logit(1 − R)
         R_p = 1.0 - torch.sigmoid(logit_p)
-
-        R_in = R_p
+        R_in_p = R_p
         if rec_mask is not None:
-            R_in = R_p * (~rec_mask).to(R_p.dtype).unsqueeze(-1)
-        rep_tokens = torch.stack([R_in * up, 1.0 - R_in], dim=-1).reshape(BC, self.N, 2 * self.P)
-        u_hat_p, h = self._run(self.repairer, rep_tokens)
-
+            R_in_p = R_p * (~rec_mask).to(R_p.dtype).unsqueeze(-1)
         logit = from_patches(logit_p, B, C, pad)
         R = from_patches(R_p, B, C, pad)
-        u_hat = from_patches(u_hat_p, B, C, pad)
-        c1 = u_hat * s + m
 
-        if not need_route:
-            aux = dict(logit=logit, R=R, u_hat=u_hat, m=m, s=s, x_tilde=x, alpha=torch.zeros_like(x))
-            self.last_aux = aux
-            return x, aux
+        aux = dict(logit=logit, R=R, m=m, s=s, B=B, C=C, pad=pad)
+        if self.arch == 'v5':
+            R_in = from_patches(R_in_p, B, C, pad)
+            st = self.stage1(x, R_in, s)
+            u_base = ((st['c_base'] - m) / s).clamp(-self.u_clip, self.u_clip).detach()
+            delta_p, h = self._e1(R_in_p, up, u_base)
+            delta = from_patches(delta_p, B, C, pad)
+            aux['u_hat'] = u_base + delta  # reconstruction target frame; stage 1 detached
+            target = st['c_base'] + delta * s  # forecast path: Router gradient through c_base
+            cand = torch.stack([target, st['c2'], st['c3']], dim=-1)
+            lo_prior = (st['prior'][..., 1] - st['prior'][..., 0]) * st['a3']
+            lo_corr = (st['corr'][..., 1] - st['corr'][..., 0]) * st['a3']
+            aux.update(pi=st['pi'], c=cand, avail=st['avail'], route_in=st['phi'], route_prior=st['prior'],
+                       ehat=st['ehat'], delta_u=delta, delta_x=delta * s, route_lo_prior=lo_prior,
+                       route_lo_corr=lo_corr, gap=from_series(st['ctx']['gap'], B, C),
+                       cand_avail=torch.stack([torch.ones_like(st['a3']), torch.ones_like(st['a3']), st['a3']], -1))
+            if not need_route:
+                aux.update(x_tilde=x, alpha=torch.zeros_like(x), target=target)
+                self.last_aux = aux
+                return x, aux
+        else:
+            u_hat_p, h = self._e1(R_in_p, up)
+            u_hat = from_patches(u_hat_p, B, C, pad)
+            aux['u_hat'] = u_hat
+            c1 = u_hat * s + m
+            if not need_route:
+                aux.update(x_tilde=x, alpha=torch.zeros_like(x))
+                self.last_aux = aux
+                return x, aux
+            ctx, c2, c3, a3, spread3 = self._param_free(x, R)
+            cand = torch.stack([c1, c2, c3], dim=-1)
+            ones = torch.ones_like(a3)
+            avail = torch.stack([ones, ones & self.expert_enabled[1], a3], dim=-1)
+            route_in = route_features(ctx, R, cand, s, a3, spread3) if self.router_type == 'linear' else h
+            pi = self._route_v4(route_in, avail, B, C, pad)
+            target = (pi * cand).sum(dim=-1)
+            aux.update(pi=pi, c=cand, avail=avail, cand_avail=avail, route_in=route_in,
+                       gap=from_series(ctx['gap'], B, C))
 
         Dt_p = self.compute_dependency(x, f) if compute_dep else x.new_ones(B, C, self.N)
-        cand, avail, route_in, ctx = self.candidates(x, R, c1, s, h=h)
-        pi = self.route(route_in, avail, B, C, pad)  # (B, L, C, K)
-        target = (pi * cand).sum(dim=-1)
-
         Dt = patch_to_points(Dt_p, self.P, pad)  # (B, L, C)
         if self.force_gate_zero:
             gate_logit = torch.full_like(x, -float('inf'))
@@ -300,12 +389,12 @@ class RADARWrapper(nn.Module):
         else:
             gate_logit = (F.softplus(self.gate_a) * logit.clamp(-self.logit_clip, self.logit_clip)
                           + F.softplus(self.gate_b) * torch.log(Dt + self.gate_eps) - self.tau_raw)
+            if self.gate_consistency:  # reconstruction-consistency evidence (repair detached)
+                gate_logit = gate_logit + F.softplus(self.gate_g) * torch.log1p((target.detach() - x).abs() / s)
             alpha = torch.sigmoid(gate_logit)
             x_tilde = x + alpha * (target - x)
 
-        aux = dict(logit=logit, R=R, alpha=alpha, gate_logit=gate_logit, dbar=Dt, dbar_patch=Dt_p, u_hat=u_hat,
-                   pi=pi, x_tilde=x_tilde, c=cand, avail=avail, route_in=route_in, target=target, m=m, s=s,
-                   gap=from_series(ctx['gap'], B, C), B=B, C=C, pad=pad)
+        aux.update(alpha=alpha, gate_logit=gate_logit, dbar=Dt, dbar_patch=Dt_p, x_tilde=x_tilde, target=target)
         self.last_aux = aux
         return x_tilde, aux
 

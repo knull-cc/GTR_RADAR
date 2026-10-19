@@ -9,6 +9,8 @@
 #   MODE=experts     step 2: offline expert repair errors (+ E1 if pre_v4.pth exists)       (diag_v4.py experts)
 #   MODE=det         step 3: S0 + S2 + detector AUROC per condition                         (diag_v4.py det)
 #                    DET_FEATS=v3 evaluates the v3-feature detector (separate checkpoint pre_v4_detv3.pth)
+#   MODE=eval        evaluation only (checkpoints must exist); METHODS="B0,B1,B2,Ours-plugin" by default.
+#                    e.g. ARCH=v4 METHODS=Ours-plugin MODE=eval adds the v4 plug-in as Ours-plugin-v4
 #   MODE=diag        v3 clean-headroom audit (diag_clean.py)
 #   QUICK=1          pred_len 96, seed 2024, plus the original run.py reproduction check (REPRO=1)
 #   PRED_LENS="..."  SEEDS="..."   override the grid (default: 96 192 336 720 x 2024)
@@ -20,7 +22,8 @@
 #   ABLATION=1       also train/evaluate Ours (joint training, backbone fine-tuned) as an ablation
 #   ARGMAX=1         also evaluate the plug-in with hard (argmax) routing (Ours-argmax)
 #   SKIP_EXISTING=1  reuse checkpoints that already exist (default 1; set 0 to retrain)
-#   PY=python  LOG_DIR=./logs_radar_v4  RESULTS_DIR=./results_radar_v4/  CKPT_DIR=./checkpoints_radar/
+#   PY=python  LOG_DIR=./logs_radar_v5  RESULTS_DIR=./results_radar_v5/  CKPT_DIR=./checkpoints_radar/
+#   ARCH=v4          run the v4 architecture instead of v5 (its RADAR results are recorded as Ours-plugin-v4)
 set -eo pipefail
 
 QUICK=${QUICK:-0}
@@ -35,13 +38,14 @@ REPRO_STRICT=${REPRO_STRICT:-1}
 ABLATION=${ABLATION:-0}
 ARGMAX=${ARGMAX:-0}
 PY=${PY:-python}
-LOG_DIR=${LOG_DIR:-./logs_radar_v4}
-RESULTS_DIR=${RESULTS_DIR:-./results_radar_v4/}
+LOG_DIR=${LOG_DIR:-./logs_radar_v5}
+RESULTS_DIR=${RESULTS_DIR:-./results_radar_v5/}
 CKPT_DIR=${CKPT_DIR:-./checkpoints_radar/}
 SKIP_EXISTING=${SKIP_EXISTING:-1}
 EXTRA_ARGS=${EXTRA_ARGS:-}
 RADAR_ARGS=${RADAR_ARGS:-}
 if [ -n "${DET_FEATS:-}" ]; then RADAR_ARGS="$RADAR_ARGS --det_feats $DET_FEATS"; fi
+if [ -n "${ARCH:-}" ]; then RADAR_ARGS="$RADAR_ARGS --arch $ARCH"; fi
 E3_ARGS=()
 if [ -n "${e3_period:-}" ]; then E3_ARGS=(--e3_period "$e3_period"); fi
 mkdir -p "$LOG_DIR" "$RESULTS_DIR/raw"
@@ -104,6 +108,12 @@ run_step_one() {  # MODE = revin | experts | det
   $PY -u diag_v4.py "$MODE" "${common[@]}" 2>&1 | tee "${log}__diag_${MODE}${DET_FEATS:+_det$DET_FEATS}.log"
 }
 
+run_eval_one() {
+  _setup "$1" "$2" 1
+  echo "================ [eval] $setting ================"
+  $PY -u run_radar.py eval "${common[@]}" --methods "${METHODS:-B0,B1,B2,Ours-plugin}" 2>&1 | tee "${log}__eval${ARCH:+_$ARCH}.log"
+}
+
 run_diag_one() {
   _setup "$1" "$2" 1
   echo "================ [diag] $setting ================"
@@ -124,8 +134,12 @@ run_all() {
     diag)
       for pred_len in $PRED_LENS; do for seed in $SEEDS; do run_diag_one "$pred_len" "$seed"; done; done
       return ;;
+    eval)
+      for pred_len in $PRED_LENS; do for seed in $SEEDS; do run_eval_one "$pred_len" "$seed"; done; done
+      $PY -u run_radar.py summarize --results_dir "$RESULTS_DIR" 2>&1 | tee "$LOG_DIR/summary_${model_id_name}.log"
+      return ;;
     full) ;;
-    *) echo "unknown MODE=$MODE (full | revin | experts | det | diag)"; exit 1 ;;
+    *) echo "unknown MODE=$MODE (full | revin | experts | det | eval | diag)"; exit 1 ;;
   esac
   for pred_len in $PRED_LENS; do
     for seed in $SEEDS; do

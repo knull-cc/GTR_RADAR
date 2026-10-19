@@ -5,8 +5,8 @@
 commands:
   train_base      S0  plain backbone, original training recipe (no per-epoch test pass)      -> base.pth
   train_aug       S1  fine-tune backbone with the RADAR v4 augmentation mixture (control)    -> aug_v4.pth
-  pretrain_radar  S2  frozen backbone, RADAR only (L_det + L_rec)                            -> pre_v4.pth
-  train_radar     S3  joint training, full loss (add --freeze_backbone for the plug-in)      -> radar_v4 / plugin_v4.pth
+  pretrain_radar  S2  frozen backbone, RADAR only (L_det + L_rec)                            -> pre_<arch>.pth
+  train_radar     S3  joint training, full loss (add --freeze_backbone for the plug-in)      -> radar_ / plugin_<arch>.pth
   eval                B0, B1 (GTR+Aug), B2 (Hampel), Ours-plugin [+ Ours, Ours-argmax] x the v4 test grid
   summarize           <results_dir>/raw/*.json -> summary.csv / summary_extras.csv / summary.md
   plot                figures (dependency profiles, example windows)
@@ -114,6 +114,12 @@ def build_parser():
     g.add_argument('--gate_eps', type=float, default=1e-2, help='ε in log(D̃ + ε)')
     g.add_argument('--scale_std_frac', type=float, default=0.1, help='robust scale floor: frac * window std')
     g.add_argument('--scale_min', type=float, default=1e-2, help='robust scale absolute floor')
+    g.add_argument('--arch', type=str, default='v5', choices=['v5', 'v4'],
+                   help='v5: E2/E3 selection with a leave-one-out prior + residual E1 + consistency gate; '
+                        'v4: three competing experts (E1, E2, E3)')
+    g.add_argument('--gate_consistency', type=int, default=-1,
+                   help='gate term softplus(g)*log(1+|c-x|/s): 1 on, 0 off, -1 = on for v5 / off for v4')
+    g.add_argument('--gate_g_init', type=float, default=1.0, help='initial softplus(g) of the consistency term')
     g.add_argument('--det_feats', type=str, default='v4', choices=['v4', 'v3'],
                    help='detector point features: v4 = u, du, |u-med5|, |u-med17|, MAD5 (shifted windows); v3 = 3')
     g.add_argument('--e2_k', type=int, default=3, help='E2/E3: reliable anchor points per side')
@@ -185,8 +191,8 @@ def build_parser():
     g.add_argument('--grid_seed', type=int, default=20261019, help='seed of the test-grid perturbations')
     g.add_argument('--diag_split', type=str, default='val', choices=['val', 'test'], help='split of diag_v4.py')
     g.add_argument('--radar_ckpt_dir', type=str, default='./checkpoints_radar/')
-    g.add_argument('--results_dir', type=str, default='./results_radar_v4/')
-    g.add_argument('--fig_dir', type=str, default='./figures_radar_v4/')
+    g.add_argument('--results_dir', type=str, default='./results_radar_v5/')
+    g.add_argument('--fig_dir', type=str, default='./figures_radar_v5/')
     g.add_argument('--plot_datasets', type=str, default='ETTh1,weather')
     g.add_argument('--n_examples', type=int, default=3)
     g.add_argument('--plot_conditions', type=str, default='zero_tail_k4_c100,flat_int_k8_c100',
