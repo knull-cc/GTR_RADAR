@@ -239,6 +239,16 @@ def build_parser():
     return parser
 
 
+def _part(final):
+    """Training stages write to <ckpt>.part and rename it when the stage has finished, so an interrupted run never
+    leaves a half-trained checkpoint that --skip_existing would reuse."""
+    os.makedirs(os.path.dirname(final) or '.', exist_ok=True)
+    tmp = final + '.part'
+    if os.path.exists(tmp):
+        os.remove(tmp)
+    return tmp
+
+
 def set_seed(seed):
     random.seed(seed)
     torch.manual_seed(seed)
@@ -309,7 +319,9 @@ def main():
         else:
             print('Args in experiment:')
             print(args)
-            exp.train(setting, ckpt_path=paths['base'])
+            tmp = _part(paths['base'])
+            exp.train(setting, ckpt_path=tmp)
+            os.replace(tmp, paths['base'])
         res = exp.test(conditions=('clean',), timing=False)
         clean = res['conditions']['clean']
         with open(out_json, 'w') as f:
@@ -336,27 +348,35 @@ def main():
         if args.skip_existing and os.path.exists(paths['aug']):
             print(f'skip: {paths["aug"]} exists')
             return
-        Exp_Radar(args, use_radar=False).train_aug(paths['base'], paths['aug'])
+        tmp = _part(paths['aug'])
+        Exp_Radar(args, use_radar=False).train_aug(paths['base'], tmp)
+        os.replace(tmp, paths['aug'])
 
     elif cmd == 'train_denoise':
         if args.skip_existing and os.path.exists(paths['denoise']):
             print(f'skip: {paths["denoise"]} exists')
             return
-        Exp_Radar(args, use_radar=False).train_denoise(paths['base'], paths['denoise'])
+        tmp = _part(paths['denoise'])
+        Exp_Radar(args, use_radar=False).train_denoise(paths['base'], tmp)
+        os.replace(tmp, paths['denoise'])
 
     elif cmd == 'pretrain_radar':
         if args.skip_existing and os.path.exists(paths['pre']):
             print(f'skip: {paths["pre"]} exists')
             return
-        Exp_Radar(args, use_radar=True).pretrain_radar(paths['base'], paths['pre'])
+        tmp = _part(paths['pre'])
+        Exp_Radar(args, use_radar=True).pretrain_radar(paths['base'], tmp)
+        os.replace(tmp, paths['pre'])
 
     elif cmd == 'train_radar':
         out = paths['plugin'] if args.freeze_backbone else paths['radar']
         if args.skip_existing and os.path.exists(out):
             print(f'skip: {out} exists')
             return
-        Exp_Radar(args, use_radar=True).train_radar(paths['base'], paths['pre'], out,
+        tmp = _part(out)
+        Exp_Radar(args, use_radar=True).train_radar(paths['base'], paths['pre'], tmp,
                                                      freeze_backbone=args.freeze_backbone)
+        os.replace(tmp, out)
 
     elif cmd == 'eval':
         methods = [m.strip() for m in args.methods.split(',') if m.strip()]
