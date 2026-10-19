@@ -36,6 +36,7 @@ from radar.modules import (N_POINT_FEATURES, ROUTE_FEATURES, ROUTE_FEATURES_V5, 
                            LinearRouter, LocalLinearExpert, PeriodicShapeExpert, ReliabilityNet, Repairer, Router,
                            from_patches, from_series, loo_prior, loo_prior_multi, patch_to_points, point_features,
                            reliable_context, robust_stats, route_features, route_features_v5, route_features_v6,
+                           seasonal_reference,
                            to_patches, to_series)
 
 EXPERTS = ('Repairer', 'LocalLinear', 'PeriodicShape')
@@ -195,9 +196,15 @@ class RADARWrapper(nn.Module):
 
         # ---- stage B gate (a, b, [g], τ)
         # softplus(a) = 4 makes the gate close to a switch in the unreliability logit (v1's effective slope was 20)
-        self.gate_a = nn.Parameter(torch.tensor(_inv_softplus(float(_cfg(cfg, 'gate_a_init', 4.0)))))
+        # label-free mode (v6): no corruption is ever injected in training. The detector is the stage-1 leave-one-out
+        # residual (no labels), E1 / Router learn from random masks on clean data, the gate is not trained: its
+        # three evidence terms have unit weight and τ / δ / the anchor threshold are calibrated on clean windows
+        self.label_free = bool(int(_cfg(cfg, 'label_free', 0)))
+        assert not self.label_free or v6, '--label_free needs --arch v6'
+        a_init = 1.0 if self.label_free else float(_cfg(cfg, 'gate_a_init', 4.0))
+        self.gate_a = nn.Parameter(torch.tensor(_inv_softplus(a_init)))
         self.gate_b = nn.Parameter(torch.tensor(_inv_softplus(float(_cfg(cfg, 'gate_b_init', 1.0)))))
-        self.gate_consistency = resolve_gate_consistency(cfg)
+        self.gate_consistency = resolve_gate_consistency(cfg) or self.label_free
         if self.gate_consistency:
             self.gate_g = nn.Parameter(torch.tensor(_inv_softplus(float(_cfg(cfg, 'gate_g_init', 1.0)))))
         self.tau_raw = nn.Parameter(torch.tensor(float(_cfg(cfg, 'tau_init', 1.0))))
@@ -208,6 +215,8 @@ class RADARWrapper(nn.Module):
         self.fc_mix = _auto_flag(cfg, 'fc_mix', v6)
         if self.seg_gate:  # registered only when used, so v4 / v5 checkpoints keep loading strictly
             self.register_buffer('seg_delta', torch.tensor(2.0))
+        if self.label_free:  # residual level above which a point is not used as an anchor (calibrated, 1% clean)
+            self.register_buffer('lf_q0', torch.tensor(float('inf')))
         self.oracle_gate = False  # evaluation diagnostic: α = 1 exactly on the corrupted points
         self.oracle_mask = None
         # tail-segment hypothesis (v5 / v6): "everything from the strongest tail alarm to the end is corrupted" is
@@ -463,16 +472,21 @@ class RADARWrapper(nn.Module):
 
         up, pad = to_patches(uc, self.P)  # (BC, N, P)
         BC = up.shape[0]
-        with self._sec('detector'):
-            feats = point_features(up.reshape(BC, -1), self.det_feats).reshape(BC, self.N,
-                                                                                self.P * self.n_point_feats)
-            logit_p = self._run(self.reliability, feats)  # unreliability logit ℓ = logit(1 − R)
-        R_p = 1.0 - torch.sigmoid(logit_p)
+        if self.label_free:
+            with self._sec('detector'):
+                logit, R = self._label_free_detect(x, s, need_route)
+            R_p, _ = to_patches(R, self.P)
+        else:
+            with self._sec('detector'):
+                feats = point_features(up.reshape(BC, -1), self.det_feats).reshape(BC, self.N,
+                                                                                    self.P * self.n_point_feats)
+                logit_p = self._run(self.reliability, feats)  # unreliability logit ℓ = logit(1 − R)
+            R_p = 1.0 - torch.sigmoid(logit_p)
+            logit = from_patches(logit_p, B, C, pad)
+            R = from_patches(R_p, B, C, pad)
         R_in_p = R_p
         if rec_mask is not None:
             R_in_p = R_p * (~rec_mask).to(R_p.dtype).unsqueeze(-1)
-        logit = from_patches(logit_p, B, C, pad)
-        R = from_patches(R_p, B, C, pad)
 
         aux = dict(logit=logit, R=R, m=m, s=s, B=B, C=C, pad=pad)
         if self.arch in ('v5', 'v6'):
@@ -561,6 +575,40 @@ class RADARWrapper(nn.Module):
                    target=target)
         self.last_aux = aux
         return x_tilde, aux
+
+    @torch.no_grad()
+    def label_free_score(self, x, s=None):
+        """Pass 0 of the label-free detector (no corruption labels anywhere):
+          local term     log(1 + |c_base − x| / s), stage 1 run on ALL points: every expert predicts x_t from other
+                         points (E2 / E3 anchors exclude t, E4 uses the partner channels at t) -> leave-one-out error;
+                         strong on spikes and on the edges of corrupted runs, blind inside a run (its neighbours are
+                         corrupted too)
+          non-local term log(1 + |c_ref − x| / s), c_ref = the window-level seasonal reference (other cycles with one
+                         window-wide level offset each) where the window holds another cycle, else E4 (correlated
+                         channels) where available, else 0 -> sees the inside of zeroed / held / shifted runs.
+        ℓ0 = local + non-local."""
+        if s is None:
+            _, s = robust_stats(x, std_frac=self.std_frac, s_min=self.s_min)
+        prefix, self._tprefix = self._tprefix, 'detector/'
+        st = self.stage1(x, torch.ones_like(x), s)
+        self._tprefix = prefix
+        local = torch.log1p((st['c_base'] - x).abs() / s)
+        c_seas, a_seas = seasonal_reference(x, self.periodic.offsets, self.periodic.enabled and bool(self.expert_enabled[2]))
+        c4, a4 = st['cands'][2], st['avails'][2]
+        ref = torch.where(a_seas, c_seas, c4)
+        has = a_seas | a4
+        nonlocal_ = torch.where(has, torch.log1p((ref - x).abs() / s), torch.zeros_like(x))
+        return local + nonlocal_
+
+    def _label_free_detect(self, x, s, need_route):
+        """Returns (ℓ, R): ℓ = pass-0 leave-one-out evidence (the gate's first term), R = 0 where ℓ exceeds the
+        calibrated anchor threshold lf_q0 (such points are not used as anchors / reliable inputs), 1 elsewhere.
+        In S2 (need_route=False) there is nothing to detect: ℓ = 0, R = 1 (only the random masks act)."""
+        if not need_route:
+            return torch.zeros_like(x), torch.ones_like(x)
+        ell = self.label_free_score(x, s)
+        R = (ell <= self.lf_q0).to(x.dtype)
+        return ell, R
 
     def _tail_hypothesis(self, x, logit, R, s):
         """H: the points from the strongest unreliability alarm among the last `tail_len` points to the end of the

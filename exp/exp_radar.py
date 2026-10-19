@@ -81,6 +81,8 @@ def ckpt_suffix(args, stage):
     parts = []
     from radar.radar import resolve_experts
     arch = getattr(args, 'arch', 'v6')
+    if int(getattr(args, 'label_free', 0)):
+        parts.append('lf')  # trained without any injected corruption (S2 and S3 differ)
     if getattr(args, 'det_feats', 'v4') != 'v4':
         parts.append(f'det{args.det_feats}')
     ex = ','.join(resolve_experts(args))
@@ -387,6 +389,8 @@ class Exp_Radar(Exp_Main):
         W.backbone.load_state_dict(torch.load(base_ckpt, map_location=self.device))
         for p in W.backbone.parameters():
             p.requires_grad_(False)
+        if getattr(W, 'label_free', False):
+            return self._pretrain_label_free(out_ckpt)
         _, train_loader = self.get_data('train')
         rz = self.raw_zero()
         perturber = self.mixture(rz, args.random_seed + 202)
@@ -425,6 +429,64 @@ class Exp_Radar(Exp_Main):
         for p in W.backbone.parameters():
             p.requires_grad_(True)
 
+    def _lf_batch_loss(self, W, x, y, c, rec_mask):
+        """Label-free S2 loss on clean windows: random patches are masked (R = 0 there); E1 reconstructs them
+        (L_rec) and the Router is trained by the forecast loss with the masked points replaced by the routed repair
+        (L_route, gradient reaches the Router only)."""
+        args = self.args
+        B, L, C = x.shape
+        W.repair(x, c, rec_mask=rec_mask, compute_dep=False, need_route=False)
+        aux = W.last_aux
+        sel = patch_mask_to_points(rec_mask, B, C, L, W.P)
+        l_rec = rec_loss(aux['u_hat'], x, sel, args.u_clip, aux['m'], aux['s'])
+        y = y[:, -args.pred_len:, self.f_dim:]
+        l_route = route_loss(W, aux, x, sel, y, (c,), args.pred_len, self.f_dim)
+        if l_route is None:
+            l_route = torch.zeros((), device=x.device)
+        return l_rec, l_route
+
+    def _pretrain_label_free(self, out_ckpt):
+        args = self.args
+        W = self.model
+        _, train_loader = self.get_data('train')
+        params = list(W.repairer.parameters()) + list(W.router.parameters())
+        opt = optim.Adam(params, lr=args.radar_lr)
+        lam_route = float(getattr(args, 'lam_route', 0.5))
+        _, val_loader = self.ordered_loader('val')
+        best = float('inf')
+        for epoch in range(args.pre_epochs):
+            self._train_mode(freeze_backbone=True)
+            t0, parts = time.time(), []
+            for bx, by, _, _, bc in train_loader:
+                x, y, c = self._to_dev(bx, by, bc)
+                rec_mask = self._rand_patch_mask(x.shape[0] * x.shape[2], W.N)
+                opt.zero_grad()
+                l_rec, l_route = self._lf_batch_loss(W, x, y, c, rec_mask)
+                (l_rec + lam_route * l_route).backward()
+                opt.step()
+                parts.append((l_rec.item(), l_route.item()))
+            W.eval()
+            g = torch.Generator(device=self.device).manual_seed(int(args.val_seed))
+            tot, nb = 0.0, 0
+            with torch.no_grad():
+                for bx, by, _, _, bc in val_loader:
+                    x, y, c = self._to_dev(bx, by, bc)
+                    rm = torch.rand(x.shape[0] * x.shape[2], W.N, device=self.device, generator=g) < args.rec_mask_ratio
+                    l_rec, l_route = self._lf_batch_loss(W, x, y, c, rm)
+                    tot += (l_rec + lam_route * l_route).item()
+                    nb += 1
+            v = tot / max(nb, 1)
+            pr_, pq_ = np.mean(parts, axis=0)
+            print(f'[S2-lf] epoch {epoch + 1} ({time.time() - t0:.1f}s) train rec {pr_:.4f} route {pq_:.5f} | '
+                  f'val rec+route {v:.4f}')
+            if v < best:
+                best = v
+                torch.save(W.state_dict(), out_ckpt)
+                print(f'[S2-lf] saved {out_ckpt}')
+        W.load_state_dict(torch.load(out_ckpt, map_location=self.device))
+        for p in W.backbone.parameters():
+            p.requires_grad_(True)
+
     # ------------------------------------------------------------------ S3
     def train_radar(self, base_ckpt, pre_ckpt, out_ckpt, freeze_backbone=False):
         args = self.args
@@ -437,6 +499,16 @@ class Exp_Radar(Exp_Main):
         W.backbone.load_state_dict(torch.load(base_ckpt, map_location=self.device))
         for p in W.backbone.parameters():
             p.requires_grad_(not freeze_backbone)
+        if getattr(W, 'label_free', False):
+            # nothing to train without corruptions: the gate is calibrated on clean training windows only
+            _, train_loader = self.get_data('train')
+            W.set_route_temp(float(getattr(args, 'route_temp_start', 1.0)))
+            self._calibrate_gate(W, train_loader, tag='S3-lf')
+            torch.save(W.state_dict(), out_ckpt)
+            print(f'[S3-lf] saved {out_ckpt} (calibration only, no training)')
+            for p in W.parameters():
+                p.requires_grad_(True)
+            return
         # plug-in = stage B: backbone AND stage-A modules frozen; only Router + gate (a, b, τ) are trained
         stage_b = freeze_backbone and getattr(args, 'plugin_train', 'gate') == 'gate'
         for p in W.stage_a_parameters():
@@ -550,6 +622,14 @@ class Exp_Radar(Exp_Main):
             batches.append((x, c))
             if update_dep:
                 W.calibrate_dependency(x, c)
+        if getattr(W, 'label_free', False):  # anchor threshold: (1 − frac)-quantile of the pass-0 residual
+            with torch.no_grad():
+                e0 = torch.cat([W.label_free_score(x).flatten().float() for x, _ in batches])
+            if e0.numel() > 4_000_000:
+                e0 = e0[torch.randperm(e0.numel(), device=e0.device)[:4_000_000]]
+            W.lf_q0.fill_(torch.quantile(e0, 1.0 - float(args.tau_calib_frac)).item())
+            print(f'[{tag}] label-free anchor threshold ℓ0 > {W.lf_q0.item():.3f} '
+                  f'({100 * args.tau_calib_frac:.1f}% of clean points)')
         zs, zw = [], []
         for x, c in batches:
             z = W.gate_logit_without_tau(x, c)  # point-level gate logit without τ, (B, L, C)
@@ -664,6 +744,7 @@ class Exp_Radar(Exp_Main):
             ex['fc_mix'] = bool(model.fc_mix)
             ex['oracle_gate'] = bool(model.oracle_gate)
             ex['tail_hyp'] = bool(model.tail_hyp)
+            ex['label_free'] = bool(model.label_free)
             if hasattr(model, 'tau_trained'):
                 ex['tau_trained'] = model.tau_trained
             ex['e3_period'] = int(model.e3_period)

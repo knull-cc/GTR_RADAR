@@ -814,3 +814,56 @@ def test_pre_checkpoint_loads_into_tail_hypothesis_wrapper(tmp_path):
     assert abs(float(Wt.th_b) - 1.5) < 1e-6
     for (k, v), (k2, v2) in zip(W.reliability.state_dict().items(), Wt.reliability.state_dict().items()):
         assert k == k2 and torch.equal(v, v2)
+
+
+# label-free mode (no injected corruption anywhere) --------------------------------------------------------------
+def test_label_free_detector_and_forward():
+    W, bb, _ = make_wrapper(arch='v6', label_free=1, dep_mode='none')
+    assert W.label_free and W.gate_consistency and abs(float(F_softplus(W.gate_a)) - 1.0) < 1e-5
+    t = torch.arange(L, dtype=torch.float32)
+    sig = torch.stack([torch.sin(2 * math.pi * t / 24 + 0.3 * k) * (1 + 0.1 * k) + 0.01 * t for k in range(C)], -1)
+    x = sig.unsqueeze(0).repeat(3, 1, 1)
+    x[1, 50, 0] += 5.0     # internal spike
+    x[2, -8:, 0] += 3.0    # shifted tail: the inside of the run must be seen too
+    ell = W.label_free_score(x)
+    assert ell.shape == x.shape and (ell >= 0).all()
+    q = torch.quantile(ell[0].flatten(), 0.99)
+    assert ell[1, 50, 0] > 3 * q and (ell[2, -8:, 0] > 2 * q).all()
+    ci = torch.zeros(3, dtype=torch.int32)
+    with torch.no_grad():
+        out = W(x, ci)  # lf_q0 = inf before calibration: every point is an anchor
+        assert out.shape == (3, H, C) and torch.equal(W.last_aux['R'], torch.ones_like(x))
+        W.lf_q0.fill_(float(q))
+        W(x, ci)
+        R = W.last_aux['R']
+    assert R[1, 50, 0] == 0 and (R[2, -8:, 0] == 0).all() and R[0].mean() > 0.95
+
+
+def F_softplus(v):
+    return torch.nn.functional.softplus(v)
+
+
+def test_label_free_s2_loss_and_calibration():
+    from exp.exp_radar import Exp_Radar, ckpt_suffix
+    W, _, _ = make_wrapper(arch='v6', label_free=1, dep_mode='none')
+    W.train()
+    x, ci = make_batch()
+    y = torch.randn(B, H, C)
+    rec_mask = torch.rand(B * C, W.N, generator=torch.Generator().manual_seed(1)) < 0.3
+    fake = types.SimpleNamespace(args=types.SimpleNamespace(u_clip=10.0, pred_len=H, tau_calib_batches=2,
+                                                            tau_calib_frac=0.01, tau_calib_wfrac=0.05),
+                                 f_dim=0, device=torch.device('cpu'))
+    fake._to_dev = lambda bx, by, bc: (bx.float(), by.float(), bc.int())
+    l_rec, l_route = Exp_Radar._lf_batch_loss(fake, W, x, y, ci, rec_mask)
+    (l_rec + 0.5 * l_route).backward()
+    assert torch.isfinite(l_rec) and torch.isfinite(l_route) and l_route > 0
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in W.repairer.parameters())
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in W.router.parameters())
+    assert all(p.grad is None for p in W.reliability.parameters())  # the learned detector is unused
+    g = torch.Generator().manual_seed(9)
+    loader = [(torch.randn(B, L, C, generator=g), torch.randn(B, H, C, generator=g), None, None,
+               torch.randint(0, CYCLE, (B,), generator=g)) for _ in range(2)]
+    Exp_Radar._calibrate_gate(fake, W, loader)
+    assert math.isfinite(float(W.lf_q0)) and float(W.lf_q0) > 0
+    a = types.SimpleNamespace(arch='v6', experts='auto', label_free=1, ckpt_tag='')
+    assert ckpt_suffix(a, 'pre') == '_lf' and ckpt_suffix(a, 'plugin') == '_lf'

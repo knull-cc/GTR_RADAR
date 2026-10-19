@@ -139,6 +139,10 @@ def build_parser():
     g.add_argument('--e3_cycles', type=int, default=3, help='E3 template: same-phase points t ± jT, j = 1..n')
     g.add_argument('--experts', type=str, default='auto',
                    help="enabled experts (e1 required), e.g. e1,e2; 'auto' = e1,e2,e3,e4 for v6, e1,e2,e3 otherwise")
+    g.add_argument('--label_free', type=int, default=0,
+                   help='v6 without any injected corruption: detector = stage-1 leave-one-out residual (no labels), '
+                        'E1 / Router trained with random masks on clean data (S2), gate not trained but calibrated '
+                        'on clean windows (S3). Checkpoint suffix _lf')
     g.add_argument('--tail_hyp', type=int, default=0,
                    help='tail-segment hypothesis (v5/v6): test "the window end from the strongest tail alarm on is '
                         'corrupted" against a stage-1 repair anchored before it; its evidence lowers R on that '

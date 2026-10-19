@@ -380,6 +380,29 @@ class PeriodicShapeExpert(nn.Module):
         return from_series(c3, B, C), from_series(avail, B, C), from_series(spread, B, C)
 
 
+def seasonal_reference(x, offsets, enabled=True):
+    """Window-level seasonal reference (label-free detector): c_t = median_j (x_{t+jT} + d_j) with ONE level offset per
+    cycle shift d_j = median over all valid t' of (x_t' − x_{t'+jT}). The offsets come from the whole window, so a
+    corrupted run (zeroed, held, shifted) cannot drag them along, unlike the local anchors of E3; exact under a linear
+    trend. Returns c (B, L, C) and avail (bool, B, L, C); unavailable where no other cycle lies in the window."""
+    B, L, C = x.shape
+    if not enabled:
+        return x, torch.zeros_like(x, dtype=torch.bool)
+    z = to_series(x.detach())
+    S = z.shape[0]
+    J = offsets.shape[0]
+    idx = torch.arange(L, device=x.device).view(L, 1) + offsets.view(1, J)  # (L, J)
+    inb = (idx >= 0) & (idx < L)
+    v = torch.gather(z, 1, idx.clamp(0, L - 1).reshape(1, -1).expand(S, -1)).reshape(S, L, J)
+    nan = torch.full_like(v, float('nan'))
+    v = torch.where(inb.unsqueeze(0), v, nan)
+    d = torch.nanmedian(z.unsqueeze(-1) - v, dim=1).values  # (S, J)
+    c = torch.nanmedian(v + d.unsqueeze(1), dim=-1).values  # (S, L)
+    avail = torch.isfinite(c)
+    c = torch.where(avail, c, z)
+    return from_series(c, B, C), from_series(avail, B, C)
+
+
 # --------------------------------------------------------------------------------------
 # Interpretable Router (v4, `--router linear`)
 # --------------------------------------------------------------------------------------
