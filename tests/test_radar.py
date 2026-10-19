@@ -831,6 +831,48 @@ def test_section_timers_and_variant_names():
     assert (W2.last_aux['pi'][..., 2] == 0).all()
 
 
+def test_repair_range_clamp_and_s3_revision(tmp_path):
+    """Every candidate and the final repair stay in [min, max] of the reliable points ± repair_clip·s; the S3 start
+    state is an early-stopping candidate; S3 checkpoints carry the revision tag _s2."""
+    from exp.exp_radar import EarlyStopper, ckpt_paths, ckpt_suffix
+    W, _, _ = make_wrapper(arch='v6')
+    x, ci = make_batch()
+    x = x.clone()
+    x[:, 40:48, 1] = 0.0
+    with torch.no_grad():
+        W(x, ci)
+    aux = W.last_aux
+    lo, hi = W.repair_bounds(x, aux['R'], aux['s'])
+    tol = 1e-4
+    assert (aux['c'] <= hi.unsqueeze(-1) + tol).all() and (aux['c'] >= lo.unsqueeze(-1) - tol).all()
+    assert (aux['target'] <= hi + tol).all() and (aux['target'] >= lo - tol).all()
+    rel = aux['R'] > W.e2_thr
+    xr = torch.where(rel, x, torch.full_like(x, float('nan')))
+    has = rel.any(dim=1)
+    hi_ref = torch.where(has, torch.nan_to_num(xr, nan=-1e30).amax(dim=1), x.amax(dim=1)) + 3.0 * aux['s'][:, 0]
+    assert torch.allclose(hi[:, 0], hi_ref, atol=1e-5)
+    W0, _, _ = make_wrapper(arch='v6', repair_clip=0.0)
+    assert W0.repair_bounds(x, aux['R'], aux['s']) is None
+    # early stopping keeps the start state when no epoch beats it
+    m = nn.Linear(3, 2)
+    w0 = m.weight.detach().clone()
+    st = EarlyStopper(2, str(tmp_path / 'p.pth'), verbose=False)
+    st(1.0, m)
+    with torch.no_grad():
+        m.weight.add_(1.0)
+    st(1.5, m)
+    st(1.2, m)
+    assert st.early_stop
+    assert torch.equal(torch.load(str(tmp_path / 'p.pth'))['weight'], w0)
+    a = types.SimpleNamespace(arch='v6', experts='auto', ckpt_tag='', radar_ckpt_dir=str(tmp_path), model_id='m',
+                              backbone='GTR', data='ETTh1', features='M', seq_len=96, pred_len=96, cycle=24,
+                              random_seed=2024)
+    p = ckpt_paths(a)
+    assert p['plugin'].endswith('plugin_v6_s2.pth') and p['pre'].endswith('pre_v6.pth')
+    a.repair_clip = 0.0
+    assert ckpt_suffix(a, 'plugin') == '_rc0' and ckpt_paths(a)['plugin'].endswith('plugin_v6_s2_rc0.pth')
+
+
 def test_nanmedian_small_equals_torch_nanmedian():
     g = torch.Generator().manual_seed(3)
     for shape, dim in (((40, 9, 3), -1), ((40, 9, 3, 6), 2), ((40, 3), 1), ((20, 5), -1)):

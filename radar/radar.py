@@ -161,6 +161,9 @@ class RADARWrapper(nn.Module):
         self.std_frac = float(_cfg(cfg, 'scale_std_frac', 0.1))
         self.s_min = float(_cfg(cfg, 'scale_min', 1e-2))
         self.u_clip = float(_cfg(cfg, 'u_clip', 10.0))
+        # repair range: every candidate / the final repair is clamped to [min, max] of the window's reliable points
+        # of that channel ± repair_clip·s (0 = off). Guards against extrapolation blow-ups (E4 least squares, E2 slope).
+        self.repair_clip = float(_cfg(cfg, 'repair_clip', 3.0))
 
         # ---- experts / Router
         keys = resolve_experts(cfg)
@@ -354,6 +357,28 @@ class RADARWrapper(nn.Module):
             Dt = Dp / scale
         return Dt.detach()
 
+    def repair_bounds(self, x, R, s):
+        """(lo, hi), each (B, 1, C), or None when repair_clip <= 0: range of the reliable points (R > e2_thr) of each
+        window/channel widened by repair_clip·s; windows/channels without a reliable point use all points."""
+        if self.repair_clip <= 0:
+            return None
+        rel = R.detach() > self.e2_thr
+        has = rel.any(dim=1, keepdim=True)
+        big = 1e30
+        xmax = torch.where(rel, x, torch.full_like(x, -big)).amax(dim=1, keepdim=True)
+        xmin = torch.where(rel, x, torch.full_like(x, big)).amin(dim=1, keepdim=True)
+        xmax = torch.where(has, xmax, x.amax(dim=1, keepdim=True))
+        xmin = torch.where(has, xmin, x.amin(dim=1, keepdim=True))
+        k = self.repair_clip * s.detach()
+        return xmin - k, xmax + k
+
+    @staticmethod
+    def clamp_repair(c, bounds):
+        if bounds is None:
+            return c
+        lo, hi = bounds
+        return torch.maximum(torch.minimum(c, hi), lo)
+
     def _param_free(self, x, R):
         """E2 / E3 candidates and the reliable context for reliability R (detached)."""
         with self._sec('stage1/context+E2'):
@@ -377,13 +402,15 @@ class RADARWrapper(nn.Module):
         """Stage 1 (v5: E2 / E3; v6: E2 / E3 / E4) with π = softmax(−log ê + wᵀφ). Returns a dict; c_base keeps the
         Router gradient, everything else is detached."""
         ctx, c2, c3, a3, spread3 = self._param_free(x, R)
+        bounds = self.repair_bounds(x, R, s)
+        c2, c3 = self.clamp_repair(c2, bounds), self.clamp_repair(c3, bounds)
         ones = torch.ones_like(a3)
         if self.arch == 'v6':
             if self._e4_on:
                 with self._sec('stage1/E4'):
                     c4, a4, corr4 = self.cross(x, R.detach() > self.e2_thr, fill=c2)
                 a4 = a4 & self.expert_enabled[3]
-                c4 = torch.where(a4, c4, c2)
+                c4 = self.clamp_repair(torch.where(a4, c4, c2), bounds)
             else:  # E4 disabled (ablation): skip its computation entirely
                 c4, a4, corr4 = c2, torch.zeros_like(a3), x.new_zeros(x.shape[0], x.shape[2])
             cands, avails = [c2, c3, c4], [ones, a3, a4]
@@ -403,7 +430,7 @@ class RADARWrapper(nn.Module):
             pi = self._softmax_route(prior + corr, avail)
             c_base = (pi * torch.stack(cands, dim=-1)).sum(dim=-1)
         return dict(ctx=ctx, cands=cands, avails=avails, prior=prior, ehat=ehat, phi=phi, corr=corr, avail=avail,
-                    pi=pi, c_base=c_base)
+                    pi=pi, c_base=c_base, bounds=bounds)
 
     # ---- v4 routing
     def _route_v4(self, route_in, avail, B, C, pad):
@@ -454,7 +481,7 @@ class RADARWrapper(nn.Module):
             st = self.stage1(x, R, s)
             u_base = ((st['c_base'] - m) / s).clamp(-self.u_clip, self.u_clip)
             delta_p, _ = self._e1(Rp, up, u_base)
-            return st['c_base'] + from_patches(delta_p, B, C, pad) * s
+            return self.clamp_repair(st['c_base'] + from_patches(delta_p, B, C, pad) * s, st['bounds'])
         u_hat_p, _ = self._e1(Rp, up)
         return from_patches(u_hat_p, B, C, pad) * s + m
 
@@ -508,7 +535,7 @@ class RADARWrapper(nn.Module):
                 delta_p, h = self._e1(R_in_p, up, u_base)
             delta = from_patches(delta_p, B, C, pad)
             aux['u_hat'] = u_base + delta  # reconstruction target frame; stage 1 detached
-            target = st['c_base'] + delta * s  # forecast path: Router gradient through c_base
+            target = self.clamp_repair(st['c_base'] + delta * s, st['bounds'])  # Router gradient through c_base
             cand = torch.stack([target] + st['cands'], dim=-1)
             av = st['avail'].to(x.dtype)
             if self.arch == 'v6':  # log-odds of E3 and E4 vs E2 (vector), 0 where unavailable

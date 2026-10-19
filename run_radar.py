@@ -110,6 +110,10 @@ def build_parser():
     g.add_argument('--radar_chunk', type=int, default=8192, help='max B*C series per RADAR network call')
     g.add_argument('--radar_grad_ckpt', type=int, default=0, help='gradient checkpointing per chunk (memory)')
     g.add_argument('--u_clip', type=float, default=10.0, help='clip robust-scaled inputs/targets of the RADAR nets')
+    g.add_argument('--repair_clip', type=float, default=3.0,
+                   help='v5/v6: clamp every repair candidate and the final repair to [min, max] of the reliable points '
+                        'of the window/channel ± repair_clip·s (0 = off; non-default values get the suffix _rc<k>)')
+    g.add_argument('--s3_grad_clip', type=float, default=5.0, help='S3: clip the global gradient norm (0 = off)')
     g.add_argument('--tau_init', type=float, default=1.0, help='initial gate offset τ (log-linear gate)')
     g.add_argument('--gate_T', type=float, default=0.05, help='(unused since RADAR v2)')
     g.add_argument('--gate_eps', type=float, default=1e-2, help='ε in log(D̃ + ε)')

@@ -115,6 +115,8 @@ def ckpt_suffix(args, stage):
             parts.append('th' + ('' if int(getattr(args, 'tail_hyp_len', 16)) == 16 else str(args.tail_hyp_len)))
         if stage == 'plugin' and getattr(args, 'plugin_train', 'all') != 'all':
             parts.append(f'p{args.plugin_train}')
+        if arch in ('v5', 'v6') and float(getattr(args, 'repair_clip', 3.0)) != 3.0:
+            parts.append(f'rc{float(args.repair_clip):g}')
     if getattr(args, 'ckpt_tag', ''):
         parts.append(args.ckpt_tag)
     return ('_' + '_'.join(parts)) if parts else ''
@@ -127,10 +129,13 @@ def ckpt_paths(args):
     # consistency gate; v6: v5 + E4 + segment gate + forecast mixing), so architectures never load each other's
     # files. base (pure GTR) is shared; the GTR+Aug control (aug_v4) depends only on the v4 perturbation mixture and
     # is shared by v4, v5 and v6.
+    # S3 revision 2 (2026-10-20): repair range clamp, the calibrated start state is an early-stopping candidate,
+    # gradient clipping. New S3 files (`_s2`) so older plug-ins are never reused; S2 (pre_) is unchanged.
     arch = getattr(args, 'arch', 'v6')
+    rev = '_s2' if arch in ('v5', 'v6') else ''
     names = dict(base='base', aug='aug_v4', denoise='denoise_v4', pre=f'pre_{arch}' + ckpt_suffix(args, 'pre'),
-                 radar=f'radar_{arch}' + ckpt_suffix(args, 'radar'),
-                 plugin=f'plugin_{arch}' + ckpt_suffix(args, 'plugin'))
+                 radar=f'radar_{arch}{rev}' + ckpt_suffix(args, 'radar'),
+                 plugin=f'plugin_{arch}{rev}' + ckpt_suffix(args, 'plugin'))
     return {k: os.path.join(d, f'{v}.pth') for k, v in names.items()}
 
 
@@ -735,10 +740,13 @@ class Exp_Radar(Exp_Main):
         torch.manual_seed(args.random_seed + 7)  # same CPU RNG stream as S1 -> identical batches/perturbations
         s, cl, pe = self.val_score(W, val_pert)
         print(f'[{tag}] start: val_score {s:.6f} (clean {cl:.6f}, perturbed {pe:.6f})')
+        stopper(s, W)  # the calibrated start state is a candidate: S3 must beat it on validation to replace it
+        clip_params = [p for g in groups for p in g['params']]
+        grad_clip = float(getattr(args, 's3_grad_clip', 5.0))
         for epoch in range(args.ft_epochs):
             W.set_route_temp(self._route_temp(epoch))
             self._train_mode(freeze_backbone, freeze_stage_a=stage_b)
-            t0, logs = time.time(), []
+            t0, logs, gnorms = time.time(), [], []
             for bx, by, _, _, bc in train_loader:
                 x_clean = bx.float()
                 x_p, mask, _ = perturber(x_clean)
@@ -770,14 +778,19 @@ class Exp_Radar(Exp_Main):
                     for p, g in zip(route_params, g_route):
                         if g is not None:
                             p.grad = g.detach() if p.grad is None else p.grad + g.detach()
+                if grad_clip > 0:
+                    gn = torch.nn.utils.clip_grad_norm_([p for p in clip_params if p.grad is not None], grad_clip)
+                    gnorms.append(float(gn))
                 opt.step()
                 parts['route'] = float(l_route.detach()) if l_route is not None else 0.0
                 logs.append([parts[k] for k in ('mse', 'det', 'rec', 'hind', 'alpha', 'route')])
             m = np.mean(logs, axis=0)
+            gtxt = (f' grad_norm med {np.median(gnorms):.2f} max {np.max(gnorms):.1f} (clip {grad_clip:g})'
+                    if gnorms else '')
             s, cl, pe = self.val_score(W, val_pert)
             print(f'[{tag}] epoch {epoch + 1} ({time.time() - t0:.1f}s) mse {m[0]:.5f} det {m[1]:.4f} '
                   f'rec {m[2]:.4f} hind {m[3]:.4f} route {m[5]:.5f} mean_alpha {m[4]:.4f} tau {W.tau.item():.3f} '
-                  f'T_route {W.route_temp.item():.2f} | val_score {s:.6f} (clean {cl:.6f}, perturbed {pe:.6f})')
+                  f'T_route {W.route_temp.item():.2f}{gtxt} | val_score {s:.6f} (clean {cl:.6f}, perturbed {pe:.6f})')
             stopper(s, W)
             if stopper.early_stop:
                 print('Early stopping')
