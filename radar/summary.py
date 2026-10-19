@@ -22,14 +22,15 @@ import numpy as np
 from radar.perturb import OOD_TYPES, POS_LABEL, POSITIONS, TYPE_LABEL, TYPES, parse_condition
 
 MAIN_METHODS = ('B0', 'B1', 'B2', 'Ours-plugin')
-EXTRA_METHODS = ('Ours-uncal', 'Ours-argmax', 'Ours-oracle', 'Ours')
+EXTRA_METHODS = ('Ours-recal', 'Ours-uncal', 'Ours-argmax', 'Ours-oracle', 'Ours')
 ALL_METHODS = MAIN_METHODS + EXTRA_METHODS
 BASELINES = ('B0', 'B1', 'B2')
 OURS = 'Ours-plugin'
-RADAR_METHODS = ('Ours-plugin', 'Ours-uncal', 'Ours-argmax', 'Ours-oracle', 'Ours')
+RADAR_METHODS = ('Ours-plugin', 'Ours-recal', 'Ours-uncal', 'Ours-argmax', 'Ours-oracle', 'Ours')
 METHOD_LABEL = {'B0': 'B0 GTR', 'B1': 'B1 GTR+Aug', 'B2': 'B2 GTR+Hampel', 'Ours-plugin': 'Ours-plugin',
                 'Ours-argmax': 'Ours-plugin (argmax π)', 'Ours-oracle': 'Ours-plugin (oracle gate)',
                 'Ours-uncal': 'Ours-plugin (τ as trained, no recalibration)',
+                'Ours-recal': 'Ours-plugin (τ recalibrated to the clean budget)',
                 'Ours': 'Ours (joint)'}
 DATASET_ORDER = ['etth1', 'etth2', 'ettm1', 'ettm2', 'weather', 'electricity', 'traffic', 'solar']
 MAIN_GROUPS = [(t, p) for t in TYPES for p in POSITIONS]
@@ -207,7 +208,8 @@ def summarize(results_dir='./results_radar_v6/', print_tables=True, **_):
 
     if OURS in methods:
         comps = [b for b in BASELINES if b in methods] + sorted(
-            m for m in methods if m != OURS and (m.startswith('Ours-plugin') or m.startswith('Ours-uncal')))
+            m for m in methods if m != OURS and (m.startswith('Ours-plugin') or m.startswith('Ours-uncal')
+                                                 or m.startswith('Ours-recal')))
         md.append('### Δ MSE of Ours-plugin vs each baseline (and earlier architectures / variants), (B − Ours) / B, '
                   '+ = Ours-plugin better, − = the other row better')
         rows = []

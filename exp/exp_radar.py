@@ -129,7 +129,8 @@ def load_pre_state(W, path, device):
     own = W.state_dict()
     keep = {k: v for k, v in sd.items() if k in own and own[k].shape == v.shape}
     skipped = sorted(set(sd) - set(keep))
-    missing = sorted(k for k in own if k not in keep and not k.startswith('router.'))
+    s3_only = ('router.', 'th_')  # trained in S3 only (Router, tail-hypothesis scalars): keep their initial values
+    missing = sorted(k for k in own if k not in keep and not k.startswith(s3_only))
     if missing:
         raise RuntimeError(f'{path}: missing / mismatched non-Router keys {missing[:8]}')
     W.load_state_dict(keep, strict=False)
@@ -680,13 +681,14 @@ class Exp_Radar(Exp_Main):
         return lambda x: hampel_filter(x, a.hampel_window, a.hampel_k, a.hampel_mad_scale)
 
     METHOD_CKPT = {'B0': 'base', 'B1': 'aug', 'B2': 'base', 'Ours': 'radar', 'Ours-plugin': 'plugin',
-                   'Ours-argmax': 'plugin', 'Ours-oracle': 'plugin', 'Ours-uncal': 'plugin'}
+                   'Ours-argmax': 'plugin', 'Ours-oracle': 'plugin', 'Ours-uncal': 'plugin', 'Ours-recal': 'plugin'}
 
     def load_method(self, method, paths):
         """Returns (model, preprocess) for a method, or (None, None) if its checkpoint is missing.
         'Ours-argmax' = the plug-in checkpoint evaluated with hard (argmax) routing; 'Ours-oracle' = the plug-in
         with a perfect gate (α = 1 exactly on the corrupted points; diagnostic upper bound of the gate);
-        'Ours-uncal' = the plug-in with τ as trained (no post-training recalibration; v6 recalibrates by default)."""
+        'Ours-recal' = the plug-in with τ / δ recalibrated after training to the clean false-repair budget
+        (--tau_recal 1 applies this to Ours-plugin too); 'Ours-uncal' = τ as trained (kept for older results)."""
         need = self.METHOD_CKPT[method]
         if not os.path.exists(paths[need]):
             return None, None
@@ -700,8 +702,8 @@ class Exp_Radar(Exp_Main):
             m.route_hard = True
         if method == 'Ours-oracle':
             m.oracle_gate = True
-        if (method in ('Ours', 'Ours-plugin', 'Ours-argmax') and resolve_tau_recal(self.args)
-                and float(self.args.tau_calib_frac) > 0):
+        if (method == 'Ours-recal' or (method in ('Ours', 'Ours-plugin', 'Ours-argmax')
+                                        and resolve_tau_recal(self.args))) and float(self.args.tau_calib_frac) > 0:
             # post-training recalibration of τ (and δ) on clean training windows: S3 keeps training the detector and
             # the gate after the initial calibration, so the false-repair budget drifts; the dependency profile is
             # left as trained

@@ -72,8 +72,10 @@ def resolve_gate_consistency(cfg):
 
 
 def resolve_tau_recal(cfg):
-    """--tau_recal: post-training recalibration of τ at evaluation; 1 / 0, or -1 (default) = on for v6 only."""
-    return _auto_flag(cfg, 'tau_recal', str(_cfg(cfg, 'arch', 'v6')) == 'v6')
+    """--tau_recal: post-training recalibration of τ at evaluation for Ours-plugin; 1 / 0, -1 (default) = off.
+    On ETTh1 the trained τ was the better operating point (recalibrating to 5% of clean windows helped Clean by
+    0.5% but cost 1–12% on the corrupted tails), so the recalibrated gate is reported as 'Ours-recal' instead."""
+    return _auto_flag(cfg, 'tau_recal', False)
 
 
 def resolve_experts(cfg):

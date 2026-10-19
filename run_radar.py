@@ -145,8 +145,8 @@ def build_parser():
                         'segment and enters the gate (3 learned scalars). Checkpoint suffix _th')
     g.add_argument('--tail_hyp_len', type=int, default=16, help='tail hypothesis: candidate start in the last n points')
     g.add_argument('--tau_recal', type=int, default=-1,
-                   help='post-training recalibration of τ (and δ) on clean training windows when a plug-in is '
-                        'evaluated; 1 on, 0 off, -1 = on for v6 (Ours-uncal evaluates the trained τ)')
+                   help='post-training recalibration of τ (and δ) on clean training windows when Ours-plugin is '
+                        'evaluated; 1 on, 0 / -1 (default) off. The method Ours-recal always recalibrates')
     g.add_argument('--e4_k', type=int, default=3,
                    help='E4 (cross-channel): reliable partner channels with the largest |corr| in the window')
     g.add_argument('--router', type=str, default='linear', choices=['linear', 'h'],
@@ -205,8 +205,8 @@ def build_parser():
     g.add_argument('--skip_existing', type=int, default=0, help='skip a training stage if its checkpoint exists')
     g.add_argument('--methods', type=str, default='B0,B1,B2,Ours-plugin',
                    help='add Ours (joint-training ablation), Ours-argmax (plug-in with hard routing), '
-                        'Ours-oracle (plug-in with a perfect gate: diagnostic upper bound) or Ours-uncal (plug-in '
-                        'without the post-training τ recalibration)')
+                        'Ours-oracle (plug-in with a perfect gate: diagnostic upper bound) or Ours-recal (plug-in '
+                        'with τ recalibrated after training to the clean false-repair budget)')
     g.add_argument('--conditions', type=str, default='grid',
                    help="'grid' = the v4 test grid (--test_grid), or a comma list of condition names "
                         "(e.g. zero_tail_k4_c100; legacy T1_raw, T2_k4, T3_flat ...)")

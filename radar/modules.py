@@ -246,13 +246,32 @@ def reliable_context(M, K=3):
     return dict(M=M, gap=gap, dl=dl, dr=dr, has_l=has_l, has_r=has_r, pb=pb, vb=vb, pf=pf, vf=vf)
 
 
+def nanmedian_small(v, dim=-1):
+    """torch.nanmedian(v, dim).values (lower median, NaN-aware) with a branch-free fast path for size-3 dims:
+    min / max comparisons instead of a sort (E2 sides, E3 level offsets, E4 partners; k = 3 by default).
+    The selected element is identical to torch.nanmedian, so results do not change."""
+    n = v.shape[dim]
+    if n != 3:
+        return torch.nanmedian(v, dim=dim).values
+    a, b, c = v.unbind(dim)
+    na, nb, nc = torch.isnan(a), torch.isnan(b), torch.isnan(c)
+    inf = torch.full_like(a, float('inf'))
+    A, Bv, Cv = torch.where(na, inf, a), torch.where(nb, inf, b), torch.where(nc, inf, c)
+    lo_ab, hi_ab = torch.minimum(A, Bv), torch.maximum(A, Bv)
+    mid = torch.maximum(lo_ab, torch.minimum(hi_ab, Cv))  # median of 3 (all valid)
+    lo = torch.minimum(lo_ab, Cv)                          # lower median of 1 or 2 valid values
+    cnt = (~na).to(torch.int8) + (~nb).to(torch.int8) + (~nc).to(torch.int8)
+    out = torch.where(cnt == 3, mid, lo)
+    return torch.where(cnt == 0, torch.full_like(a, float('nan')), out)
+
+
 def _side(z, p, v):
     """Robust level of z at the anchor positions p (S, L, K) where v (and z finite).
     Returns (nanmedian level, mean anchor position, any-valid), each (S, L)."""
     S, L, K = p.shape
     vals = torch.gather(z, 1, p.reshape(S, -1)).reshape(S, L, K)
     v = v & torch.isfinite(vals)
-    lev = torch.nanmedian(torch.where(v, vals, torch.full_like(vals, float('nan'))), dim=-1).values
+    lev = nanmedian_small(torch.where(v, vals, torch.full_like(vals, float('nan'))), dim=-1)
     w = v.to(z.dtype)
     pos = (w * p.to(z.dtype)).sum(-1) / w.sum(-1).clamp_min(1.0)
     return lev, pos, v.any(dim=-1)
@@ -330,7 +349,7 @@ class PeriodicShapeExpert(nn.Module):
         xs, oks = self._take(z, Mu, p.unsqueeze(-1) + self.offsets.view(1, 1, 1, J))  # (S, L, K, J)
         ok = v.unsqueeze(-1) & oks
         diff = torch.where(ok, xa - xs, torch.full_like(xs, float('nan')))
-        lev = torch.nanmedian(diff, dim=2).values
+        lev = nanmedian_small(diff, dim=2)
         w = ok.to(z.dtype)
         pos = (w * p.unsqueeze(-1).to(z.dtype)).sum(dim=2) / w.sum(dim=2).clamp_min(1.0)
         return lev, pos, ok.any(dim=2)
@@ -503,7 +522,7 @@ class CrossChannelExpert(nn.Module):
         mp = torch.gather(M.to(torch.uint8), 2, flat).reshape(B, L, C, k).bool()
         valid = mp & (sc > 0).unsqueeze(1)
         pred = inter.unsqueeze(1) + slope.unsqueeze(1) * xp
-        c4 = torch.nanmedian(torch.where(valid, pred, torch.full_like(pred, float('nan'))), dim=-1).values
+        c4 = nanmedian_small(torch.where(valid, pred, torch.full_like(pred, float('nan'))), dim=-1)
         avail = torch.isfinite(c4)
         c4 = torch.where(avail, c4, fill)
         best = sc[..., 0].clamp_min(0.0)

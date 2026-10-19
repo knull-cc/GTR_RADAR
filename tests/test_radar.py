@@ -24,6 +24,7 @@ from radar.losses import (det_loss, hindsight_loss, hindsight_targets, patch_mas
                           radar_loss, rec_loss, route_loss)
 from radar.modules import (ROUTE_FEATURES, ROUTE_FEATURES_V5, ROUTE_FEATURES_V6,  # noqa: E402
                            CrossChannelExpert, LocalLinearExpert, PeriodicShapeExpert, ReliableNeighborExpert,
+                           nanmedian_small,
                            from_patches, hampel_filter, loo_prior, loo_prior_multi, point_features,
                            reliable_context, robust_stats, shifted_windows, to_patches, to_series)
 from radar.perturb import (MixturePerturber, apply_condition, apply_test_perturbation, condition_rng,  # noqa: E402
@@ -297,6 +298,9 @@ def test_legacy_reliable_neighbor_expert_and_scale_floor():
 @pytest.mark.parametrize('arch', ['v5', 'v6'])
 def test_gradients_joint_stage_b_and_route_loss(arch):
     W, bb, cfg = make_wrapper(arch=arch)
+    if arch == 'v6':  # open the gate everywhere: with nothing repaired the forecast path skips the repair entirely
+        with torch.no_grad():
+            W.tau_raw.fill_(-1e4)
     x, ci = make_batch()
     y = torch.randn(B, H, C)
     x_p = x.clone()
@@ -789,3 +793,24 @@ def test_section_timers_and_variant_names():
     with torch.no_grad():
         W2(x, ci)
     assert (W2.last_aux['pi'][..., 2] == 0).all()
+
+
+def test_nanmedian_small_equals_torch_nanmedian():
+    g = torch.Generator().manual_seed(3)
+    for shape, dim in (((40, 9, 3), -1), ((40, 9, 3, 6), 2), ((40, 3), 1), ((20, 5), -1)):
+        v = (torch.randn(*shape, generator=g) * 10).round() / 10  # ties
+        v[torch.rand(*shape, generator=g) < 0.35] = float('nan')
+        a, b = nanmedian_small(v, dim=dim), torch.nanmedian(v, dim=dim).values
+        assert torch.equal(torch.isnan(a), torch.isnan(b)) and torch.equal(a[~torch.isnan(a)], b[~torch.isnan(b)])
+
+
+def test_pre_checkpoint_loads_into_tail_hypothesis_wrapper(tmp_path):
+    from exp.exp_radar import load_pre_state
+    W, _, _ = make_wrapper(arch='v6')
+    p = tmp_path / 'pre.pth'
+    torch.save(W.state_dict(), p)  # S2 saves the full wrapper state
+    Wt, _, _ = make_wrapper(arch='v6', tail_hyp=1, seed=4)
+    load_pre_state(Wt, str(p), torch.device('cpu'))  # th_* keep their initial values
+    assert abs(float(Wt.th_b) - 1.5) < 1e-6
+    for (k, v), (k2, v2) in zip(W.reliability.state_dict().items(), Wt.reliability.state_dict().items()):
+        assert k == k2 and torch.equal(v, v2)
