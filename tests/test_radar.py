@@ -1,4 +1,4 @@
-"""RADAR v4 unit tests (B=4, L=96, C=7, H=96, cycle=24; randomly initialised GTR in eval mode).
+"""RADAR unit tests, v4 / v5 / v6 (B=4, L=96, C=7, H=96, cycle=24; randomly initialised GTR in eval mode).
 
 Run from the repository root:  python -m pytest -q tests/test_radar.py
 """
@@ -22,12 +22,13 @@ from models import GTR as GTR_module  # noqa: E402
 from radar.dependency import hutchinson_dependency, patch_sum  # noqa: E402
 from radar.losses import (det_loss, hindsight_loss, hindsight_targets, patch_mask_to_points,  # noqa: E402
                           radar_loss, rec_loss, route_loss)
-from radar.modules import (ROUTE_FEATURES, ROUTE_FEATURES_V5, LocalLinearExpert, PeriodicShapeExpert,  # noqa: E402
-                           ReliableNeighborExpert, from_patches, hampel_filter, loo_prior, point_features,
+from radar.modules import (ROUTE_FEATURES, ROUTE_FEATURES_V5, ROUTE_FEATURES_V6,  # noqa: E402
+                           CrossChannelExpert, LocalLinearExpert, PeriodicShapeExpert, ReliableNeighborExpert,
+                           from_patches, hampel_filter, loo_prior, loo_prior_multi, point_features,
                            reliable_context, robust_stats, shifted_windows, to_patches, to_series)
 from radar.perturb import (MixturePerturber, apply_condition, apply_test_perturbation, condition_rng,  # noqa: E402
                            grid_conditions, parse_condition, perturb_batch, raw_zero_from_scaler)
-from radar.radar import RADARWrapper  # noqa: E402
+from radar.radar import RADARWrapper, segment_max  # noqa: E402
 
 B, L, C, H, CYCLE = 4, 96, 7, 96, 24
 
@@ -38,7 +39,7 @@ def make_cfg(**kw):
         radar_patch=8, radar_d=64, radar_heads=4, radar_layers=2, radar_dff=128, radar_dropout=0.1,
         radar_chunk=8192, u_clip=10.0, tau_init=1.0, gate_eps=1e-2, dep_mode='grad', dep_probes=4,
         dep_probe_dist='rademacher', dep_ema=0.99, force_gate_zero=False, e2_k=3, e2_thr=0.5,
-        arch='v5', det_feats='v4', e3_period=24, e3_cycles=3, experts='e1,e2,e3', router='linear',
+        arch='v5', det_feats='v4', e3_period=24, e3_cycles=3, experts='auto', router='linear',
         route_temp_start=1.0, gate_consistency=-1,
         scale_std_frac=0.1, scale_min=1e-2,
         lam_det=0.5, lam_rec=0.5, lam_hind=0.5, lam_alpha=0.01, pos_weight=1.0, pu_neg_weight=0.1)
@@ -67,7 +68,7 @@ def make_wrapper(seed=0, **kw):
 
 
 # 1 ------------------------------------------------------------------------------------------------------
-@pytest.mark.parametrize('arch,router', [('v5', 'linear'), ('v4', 'linear'), ('v4', 'h')])
+@pytest.mark.parametrize('arch,router', [('v6', 'linear'), ('v5', 'linear'), ('v4', 'linear'), ('v4', 'h')])
 def test_output_shape_matches_backbone(arch, router):
     W, bb, _ = make_wrapper(arch=arch, router=router)
     x, ci = make_batch()
@@ -78,14 +79,21 @@ def test_output_shape_matches_backbone(arch, router):
     aux = W.last_aux
     for k in ('logit', 'R', 'alpha', 'dbar', 'u_hat', 'x_tilde', 'target', 'gap'):
         assert aux[k].shape == (B, L, C), k
-    K = 2 if arch == 'v5' else 3
+    K = {'v6': 3, 'v5': 2, 'v4': 3}[arch]
+    Kc = 4 if arch == 'v6' else 3
     assert aux['pi'].shape == (B, L, C, K) and aux['avail'].shape == (B, L, C, K)
-    assert aux['c'].shape == (B, L, C, 3) and aux['cand_avail'].shape == (B, L, C, 3)
+    assert aux['c'].shape == (B, L, C, Kc) and aux['cand_avail'].shape == (B, L, C, Kc)
     assert aux['dbar_patch'].shape == (B, C, L // 8)
     assert torch.allclose(aux['pi'].sum(-1), torch.ones(B, L, C), atol=1e-5)
     assert (aux['pi'][~aux['avail']] == 0).all()
-    if arch == 'v5':
-        assert W.gate_consistency and aux['route_in'].shape == (B, L, C, len(ROUTE_FEATURES_V5))
+    if arch == 'v6':
+        assert W.seg_gate and W.fc_mix and aux['rho'].shape == (B, C)
+        assert aux['route_lo_prior'].shape == (B, L, C, 2)
+    else:
+        assert not W.seg_gate and not W.fc_mix and 'rho' not in aux
+    if arch in ('v5', 'v6'):
+        feats = ROUTE_FEATURES_V6 if arch == 'v6' else ROUTE_FEATURES_V5
+        assert W.gate_consistency and aux['route_in'].shape == (B, L, C, len(feats))
         # residual E1 starts as the identity on the stage-1 repair (zero-initialised head)
         assert torch.count_nonzero(aux['delta_u']) == 0
         c_base = (aux['pi'] * aux['c'][..., 1:]).sum(-1)
@@ -286,8 +294,9 @@ def test_legacy_reliable_neighbor_expert_and_scale_floor():
 
 
 # 6 ------------------------------------------------------------------------------------------------------
-def test_gradients_joint_stage_b_and_route_loss():
-    W, bb, cfg = make_wrapper()
+@pytest.mark.parametrize('arch', ['v5', 'v6'])
+def test_gradients_joint_stage_b_and_route_loss(arch):
+    W, bb, cfg = make_wrapper(arch=arch)
     x, ci = make_batch()
     y = torch.randn(B, H, C)
     x_p = x.clone()
@@ -335,21 +344,23 @@ def test_gradients_joint_stage_b_and_route_loss():
     assert all(p.grad is None for p in W.backbone.parameters())
 
 
-@pytest.mark.parametrize('arch', ['v5', 'v4'])
+@pytest.mark.parametrize('arch', ['v6', 'v5', 'v4'])
 def test_routing_temperature_argmax_and_disabled_experts(arch):
-    e3 = 1 if arch == 'v5' else 2  # index of E3 in π
+    e3 = 2 if arch == 'v4' else 1  # index of E3 in π
     W, _, _ = make_wrapper(arch=arch, experts='e1,e2')
     x, ci = make_batch()
     with torch.no_grad():
         W(x, ci)
     assert (W.last_aux['pi'][..., e3] == 0).all() and not W.last_aux['avail'][..., e3].any()
+    if arch == 'v6':  # E4 disabled too
+        assert (W.last_aux['pi'][..., 2] == 0).all() and not W.last_aux['avail'][..., 2].any()
     W2, _, _ = make_wrapper(arch=arch, e3_period=96)  # T >= L -> E3 unavailable everywhere
     with torch.no_grad():
         W2(x, ci)
     assert (W2.last_aux['pi'][..., e3] == 0).all()
     W3, _, _ = make_wrapper(arch=arch)
     with torch.no_grad():
-        W3.router.lin.bias.copy_(torch.tensor([3.0] if arch == 'v5' else [0.5, -0.5]))
+        W3.router.lin.bias.copy_(torch.tensor({'v6': [3.0, -1.0], 'v5': [3.0], 'v4': [0.5, -0.5]}[arch]))
         W3.set_route_temp(0.3)
         W3(x, ci)
         pi_soft = W3.last_aux['pi']
@@ -360,7 +371,9 @@ def test_routing_temperature_argmax_and_disabled_experts(arch):
     assert torch.equal(pi_hard.sum(-1), torch.ones_like(pi_hard.sum(-1))) and set(pi_hard.unique().tolist()) <= {0., 1.}
     assert 'route_temp' in W3.state_dict() and abs(W3.state_dict()['route_temp'].item() - 0.3) < 1e-6
     coef = W3.router_coefficients()
-    if arch == 'v5':
+    if arch == 'v6':
+        assert set(coef) == {'PeriodicShape', 'CrossChannel'} and abs(coef['CrossChannel']['bias'] + 1.0) < 1e-6
+    elif arch == 'v5':
         assert set(coef) == {'PeriodicShape'} and abs(coef['PeriodicShape']['bias'] - 3.0) < 1e-6
     else:
         assert set(coef) == {'LocalLinear', 'PeriodicShape'} and abs(coef['LocalLinear']['bias'] - 0.5) < 1e-6
@@ -389,12 +402,18 @@ def test_loo_prior_prefers_the_expert_that_explains_the_neighbours():
     assert torch.isfinite(prior2).all()
 
 
-def test_v4_checkpoint_layout_differs_from_v5():
+def test_checkpoint_layouts_v4_v5_v6():
     W4, _, _ = make_wrapper(arch='v4')
     W5, _, _ = make_wrapper(arch='v5')
-    k4, k5 = set(W4.state_dict()), set(W5.state_dict())
+    W6, _, _ = make_wrapper(arch='v6')
+    k4, k5, k6 = set(W4.state_dict()), set(W5.state_dict()), set(W6.state_dict())
     assert 'gate_g' in k5 and 'gate_g' not in k4
     assert W4.repairer.body.proj.in_features == 2 * 8 and W5.repairer.body.proj.in_features == 3 * 8
+    # v6 adds only the segment-gate offset δ (buffer) and a wider Router; v4 / v5 checkpoints keep loading strictly
+    assert k6 - k5 == {'seg_delta'} and 'seg_delta' not in k5 and 'seg_delta' not in k4
+    assert W6.router.lin.weight.shape == (2, len(ROUTE_FEATURES_V6))
+    W5b, _, _ = make_wrapper(arch='v5', seed=3)
+    W5b.load_state_dict(W5.state_dict())  # strict
 
 
 # 7 ------------------------------------------------------------------------------------------------------
@@ -442,13 +461,15 @@ def test_patch_roundtrip_and_hampel():
     assert hf.shape == x.shape and torch.isfinite(hf).all()
 
 
-def test_seq_len_not_multiple_of_patch():
-    W, bb, _ = make_wrapper(seq_len=93)
+@pytest.mark.parametrize('arch', ['v5', 'v6'])
+def test_seq_len_not_multiple_of_patch(arch):
+    W, bb, _ = make_wrapper(seq_len=93, arch=arch)
     x = torch.randn(B, 93, C)
     ci = torch.randint(0, CYCLE, (B,)).int()
     with torch.no_grad():
         out = W(x, ci)
-    assert out.shape == (B, H, C) and W.last_aux['pi'].shape == (B, 93, C, 2) and W.last_aux['c'].shape[1] == 93
+    K = 3 if arch == 'v6' else 2
+    assert out.shape == (B, H, C) and W.last_aux['pi'].shape == (B, 93, C, K) and W.last_aux['c'].shape[1] == 93
 
 
 def test_ema_profile_and_global_scale():
@@ -508,10 +529,11 @@ def test_revin_forward_reproduces_gtr():
     assert bb.use_revin == 1
 
 
-def test_eval_stats_and_summary(tmp_path):
+@pytest.mark.parametrize('arch', ['v5', 'v6'])
+def test_eval_stats_and_summary(tmp_path, arch):
     from exp.exp_radar import RadarStats, hist_auroc
     from radar.summary import summarize
-    W, _, _ = make_wrapper(dep_mode='none')
+    W, _, _ = make_wrapper(dep_mode='none', arch=arch)
     x, ci = make_batch()
     rz = np.full(C, -3.0, dtype=np.float32)
     st_clean, st = RadarStats(W.n_experts, len(W.cand_names)), RadarStats(W.n_experts, len(W.cand_names))
@@ -523,12 +545,16 @@ def test_eval_stats_and_summary(tmp_path):
         st.update(W.last_aux, x, xp, ch)
     r = st.result()
     assert r['n_changed'] == int(ch.sum()) and r['err_raw'] > 0 and len(r['pi_open_by_gap']) == 5
-    assert len(r['err_expert']) == 3 and len(r['pi_changed']) == 2 and 'delta_changed' in r
+    assert len(r['err_expert']) == len(W.cand_names) and len(r['pi_changed']) == W.n_experts and 'delta_changed' in r
+    if arch == 'v6':
+        assert len(r['logodds_prior_changed']) == 2 and all(math.isfinite(v) for v in r['logodds_prior_changed'])
+    else:
+        assert math.isfinite(r['logodds_prior_changed'])
     a = hist_auroc(st.hist_pos, st_clean.hist_all)
     assert 0.0 <= a <= 1.0
     raw = tmp_path / 'raw'
     raw.mkdir()
-    for m in ('B0', 'Ours-plugin'):
+    for m in ('B0', 'Ours-plugin', 'Ours-plugin-v4'):
         rec = dict(kind='eval', method=m, dataset='ETTh1', pred_len=96, seed=2024,
                    conditions={'clean': dict(mse=0.4, mae=0.4), 'zero_tail_k4_c100': dict(mse=0.6, mae=0.5)},
                    extras={'clean': st_clean.result(), 'zero_tail_k4_c100': dict(r, auroc=a),
@@ -541,3 +567,133 @@ def test_eval_stats_and_summary(tmp_path):
     assert 'Zero-T' in (tmp_path / 'summary.md').read_text()
     assert 'PeriodicShape vs LocalLinear' in (tmp_path / 'summary_router.md').read_text()
     assert 'residual E1' in (tmp_path / 'summary.md').read_text()
+    assert 'vs Ours-plugin-v4' in (tmp_path / 'summary.md').read_text()
+    if arch == 'v6':
+        assert 'CrossChannel vs LocalLinear' in (tmp_path / 'summary_router.md').read_text()
+
+
+# v6 -----------------------------------------------------------------------------------------------------
+def test_v6_closed_gate_is_the_backbone_and_open_gate_forecasts_the_repair():
+    W, bb, _ = make_wrapper(arch='v6')
+    x, ci = make_batch()
+    with torch.no_grad():
+        W.tau_raw.fill_(1e4)  # gate closed everywhere -> ρ = 0 -> ŷ = f(x)
+        out = W(x, ci)
+        assert torch.count_nonzero(W.last_aux['rho']) == 0
+        assert torch.allclose(out, bb(x, ci), atol=1e-5)
+        W.tau_raw.fill_(-1e4)  # gate open everywhere -> x̃ = repair, ρ = 1 -> ŷ = f(x̃)
+        out = W(x, ci)
+        aux = W.last_aux
+        assert torch.allclose(aux['x_tilde'], aux['target'], atol=1e-5) and torch.allclose(aux['rho'], torch.ones(B, C))
+        assert torch.allclose(out, bb(aux['target'], ci), atol=1e-5)
+        W.force_gate_zero = True
+        assert torch.allclose(W(x, ci), bb(x, ci), atol=1e-6) and 'rho' not in W.last_aux
+
+
+def test_v6_forecast_mixing_is_convex_per_channel():
+    W, bb, _ = make_wrapper(arch='v6')
+    x, ci = make_batch()
+    with torch.no_grad():
+        W.tau_raw.fill_(0.0)
+        out = W(x, ci)
+        aux = W.last_aux
+        y0, y1 = bb(x, ci), bb(aux['x_tilde'], ci)
+    ref = y0 + aux['rho'].unsqueeze(1) * (y1 - y0)
+    assert torch.allclose(out, ref, atol=1e-5)
+    hard = aux['alpha'] >= 0.5
+    assert torch.allclose(aux['x_tilde'], torch.where(hard, aux['target'], x), atol=1e-5)
+    assert torch.allclose(aux['rho'], aux['alpha'].amax(dim=1))
+
+
+def test_segment_max_runs():
+    z = torch.tensor([[0.0, 3.0, 1.0, -1.0, 2.0, 0.5], [1.0, 0.0, 0.0, 0.0, 0.0, 5.0]]).T.unsqueeze(0)  # (1, 6, 2)
+    inrun = torch.tensor([[True, True, True, False, True, True], [True, False, False, False, True, True]]).T.unsqueeze(0)
+    out = segment_max(z, inrun)
+    assert torch.equal(out[0, :, 0], torch.tensor([3.0, 3.0, 3.0, -1.0, 2.0, 2.0]))
+    assert torch.equal(out[0, :, 1], torch.tensor([1.0, 0.0, 0.0, 0.0, 5.0, 5.0]))  # no leak across series
+    zg = z.clone().requires_grad_(True)
+    segment_max(zg, inrun).sum().backward()
+    assert torch.isfinite(zg.grad).all() and zg.grad[0, 1, 0] == 3  # the run maximum receives the run's gradient
+
+
+def test_v6_segment_gate_repairs_whole_runs():
+    W, _, _ = make_wrapper(arch='v6')
+    z = torch.full((1, 12, 1), -5.0)
+    z[0, 3:7, 0] = torch.tensor([0.5, 2.0, 0.5, 0.5])  # one strong point inside a weakly suspicious run
+    z[0, 10, 0] = 0.5                                   # isolated weak false alarm (above τ − δ, below τ)
+    W.seg_delta.fill_(1.0)
+    with torch.no_grad():
+        W.tau_raw.fill_(1.0)
+    zeff = segment_max(z, z > W.tau_raw - W.seg_delta)
+    alpha = torch.sigmoid(zeff - W.tau_raw)
+    assert (alpha[0, 3:7, 0] > 0.5).all() and alpha[0, 10, 0] < 0.5 and alpha[0, 0, 0] < 0.5
+
+
+def test_cross_channel_expert_exact_on_correlated_channels():
+    g = torch.Generator().manual_seed(0)
+    base = torch.cumsum(torch.randn(2, 96, generator=g), dim=1)
+    a, b = torch.randn(5, generator=g), torch.tensor([1.0, -0.7, 2.0, 0.5, -1.5])
+    clean = a + b * base.unsqueeze(-1)
+    x, M = clean.clone(), torch.ones_like(clean, dtype=torch.bool)
+    x[:, 40:48, 0], M[:, 40:48, 0] = 0.0, False   # one channel corrupted -> E4 available and exact
+    x[:, -4:, :], M[:, -4:, :] = -3.0, False      # all channels corrupted -> E4 unavailable
+    c4, av, best = CrossChannelExpert(k=3)(x, M, fill=torch.full_like(x, -99.0))
+    assert av[:, 40:48, 0].all() and torch.allclose(c4[:, 40:48, 0], clean[:, 40:48, 0], atol=1e-3)
+    assert not av[:, -4:].any() and (c4[~av] == -99.0).all() and (best > 0.99).all()
+    c1, a1, _ = CrossChannelExpert()(x[..., :1], M[..., :1], fill=x[..., :1])
+    assert not a1.any() and torch.equal(c1, x[..., :1])
+
+
+def test_loo_prior_multi_matches_loo_prior_and_prefers_e4():
+    t = torch.arange(96.)
+    sig = torch.sin(2 * math.pi * t / 24) + 0.02 * t
+    X = torch.stack([sig + 0.1 * k for k in range(3)], dim=-1).unsqueeze(0)
+    Xc = X.clone()
+    Xc[0, 40:48, 0] = 0.0
+    R = torch.ones_like(Xc)
+    R[0, 40:48, 0] = 0.0
+    ctx = reliable_context(to_series(R) > 0.5, 3)
+    c2 = LocalLinearExpert()(Xc, ctx)
+    c3, a3, _ = PeriodicShapeExpert(24, 96, 3)(Xc, ctx, fill=c2)
+    c4, a4, _ = CrossChannelExpert(3)(Xc, R > 0.5, fill=c2)
+    _, s = robust_stats(Xc)
+    p2, _ = loo_prior(Xc, ctx, c2, c3, a3, s)
+    pm, _ = loo_prior_multi(Xc, ctx, [c2, c3], [torch.ones_like(a3), a3], s)
+    assert torch.allclose(p2, pm)
+    p3, _ = loo_prior_multi(Xc, ctx, [c2, c3, c4], [torch.ones_like(a3), a3, a4], s)
+    assert p3.shape == (1, 96, 3, 3) and torch.isfinite(p3).all()
+    assert (p3[0, 40:48, 0, 2] > p3[0, 40:48, 0, 0]).all()
+
+
+def test_v6_oracle_gate():
+    W, bb, _ = make_wrapper(arch='v6')
+    x, ci = make_batch()
+    mask = torch.zeros_like(x, dtype=torch.bool)
+    mask[:, -4:, :2] = True
+    W.oracle_gate, W.oracle_mask = True, mask
+    with torch.no_grad():
+        out = W(x, ci)
+        aux = W.last_aux
+        assert torch.equal(aux['alpha'], mask.float())
+        assert torch.equal(aux['rho'], mask.any(dim=1).float())
+        assert torch.allclose(aux['x_tilde'], torch.where(mask, aux['target'], x), atol=1e-5)
+        y0, y1 = bb(x, ci), bb(aux['x_tilde'], ci)
+    assert torch.allclose(out, torch.where(mask.any(dim=1, keepdim=True), y1, y0), atol=1e-5)
+
+
+def test_v6_gate_calibration_window_budget():
+    from exp.exp_radar import Exp_Radar
+    W, _, _ = make_wrapper(arch='v6', dep_mode='none')
+    g = torch.Generator().manual_seed(5)
+    loader = [(torch.randn(B, L, C, generator=g), torch.randn(B, H, C, generator=g), None, None,
+               torch.randint(0, CYCLE, (B,), generator=g)) for _ in range(3)]
+    fake = types.SimpleNamespace(args=types.SimpleNamespace(tau_calib_batches=3, tau_calib_frac=0.01,
+                                                            tau_calib_wfrac=0.05),
+                                 device=torch.device('cpu'))
+    fake._to_dev = lambda bx, by, bc: (bx.float(), by.float(), bc.int())
+    Exp_Radar._calibrate_gate(fake, W, loader)
+    zs = torch.cat([W.gate_logit_without_tau(bx, bc.int()) for bx, _, _, _, bc in loader])
+    frac_w = (zs.amax(dim=1) > W.tau_raw).float().mean().item()
+    assert frac_w <= 0.05 + 1e-6 and W.seg_delta.item() >= 0
+    tau_pt = W.tau_raw.item() - W.seg_delta.item()
+    assert abs((zs > tau_pt).float().mean().item() - 0.01) < 0.01

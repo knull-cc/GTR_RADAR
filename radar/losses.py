@@ -115,8 +115,8 @@ def route_loss(W, aux, x_in, pert_mask, y, bb_args, pred_len, f_dim=0):
     """L_route = MSE(f(x + m ⊙ (Σ_k π_k · sg(c_k) − x)), y) on the perturbed samples of the batch.
 
     The repair location is given by the perturbation mask m (not by the gate α), so the Router receives a forecast
-    signal wherever a corruption is; the repair is recomputed by W.route_candidate from detached inputs (v5: stage-1
-    mix of E2 / E3 plus the detached E1 correction), so only the Router depends on it. Callers take gradients w.r.t. the Router parameters only (see Exp_Radar.train_radar).
+    signal wherever a corruption is; the repair is recomputed by W.route_candidate from detached inputs (v5/v6: stage-1
+    mix of E2 / E3 [/ E4] plus the detached E1 correction), so only the Router depends on it. Callers take gradients w.r.t. the Router parameters only (see Exp_Radar.train_radar).
     Returns None when the batch holds no perturbed sample."""
     sel = pert_mask.flatten(1).any(dim=1)  # (B,)
     if not bool(sel.any()):

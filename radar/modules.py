@@ -435,6 +435,107 @@ def route_features_v5(ctx, R, c2, c3, s, avail3, spread3):
     return from_series(torch.cat(parts, dim=-1), B, C).detach()
 
 
+ROUTE_FEATURES_V6 = ROUTE_FEATURES[:16] + (
+    'log1p Δ(c2,c3)/s', 'log1p Δ(c2,c4)/s', 'log1p Δ(c3,c4)/s', 'E3 available', 'E4 available',
+    'log1p E3 spread/s', 'E4 partner |corr|')
+
+
+def route_features_v6(ctx, R, c2, c3, c4, s, avail3, avail4, spread3, corr4):
+    """(v6) Stage-1 routing features over E2 / E3 / E4, detached: φ (B, L, C, len(ROUTE_FEATURES_V6)).
+    corr4: (B, C) |correlation| of the best E4 partner."""
+    B, L, C = R.shape
+    dt = R.dtype
+    parts = _context_parts(ctx, R)
+    ss = to_series(s.expand(B, L, C))
+    a3, a4 = to_series(avail3).to(dt), to_series(avail4).to(dt)
+    z2, z3, z4 = (to_series(v.detach()) for v in (c2, c3, c4))
+    d23 = torch.log1p((z2 - z3).abs() / ss) * a3
+    d24 = torch.log1p((z2 - z4).abs() / ss) * a4
+    d34 = torch.log1p((z3 - z4).abs() / ss) * a3 * a4
+    sp = torch.log1p(to_series(spread3) / ss) * a3
+    cr = corr4.detach().reshape(B * C, 1).expand(B * C, L) * a4
+    parts += [v.unsqueeze(-1) for v in (d23, d24, d34, a3, a4, sp, cr)]
+    return from_series(torch.cat(parts, dim=-1), B, C).detach()
+
+
+class CrossChannelExpert(nn.Module):
+    """E4 (v6): "this variable moves with the variables it is most correlated with in this window".
+
+    For every channel c: among the other channels j, the k with the largest |corr(x_c, x_j)| over the window
+    points where both are reliable (≥ min_pairs points); per partner a least-squares fit x_c ≈ a + b·x_j on those
+    points; c4_t = median over the partners that are reliable at t of a + b·x_j(t). Unavailable when no partner
+    is reliable at t (e.g. all channels corrupted at once) or C = 1. Parameter-free; works on x and the detached
+    reliable mask. Returns c4 (B, L, C) (fill where unavailable), avail (B, L, C), best |corr| (B, C)."""
+
+    def __init__(self, k=3, min_pairs=8, eps=1e-6):
+        super().__init__()
+        self.k, self.min_pairs, self.eps = int(k), int(min_pairs), float(eps)
+
+    def forward(self, x, M, fill):
+        B, L, C = x.shape
+        if C < 2 or self.k < 1:
+            return fill, torch.zeros_like(x, dtype=torch.bool), x.new_zeros(B, C)
+        x = x.detach()
+        w = M.to(x.dtype)
+        xw = x * w
+        ein = torch.einsum
+        n = ein('blc,blj->bcj', w, w)  # joint reliable points of (c, j)
+        sx = ein('blc,blj->bcj', xw, w)
+        sy = ein('blc,blj->bcj', w, xw)
+        sxx = ein('blc,blj->bcj', xw * x, w)
+        syy = ein('blc,blj->bcj', w, xw * x)
+        sxy = ein('blc,blj->bcj', xw, xw)
+        nn_ = n.clamp_min(1.0)
+        mx, my = sx / nn_, sy / nn_
+        cov = sxy / nn_ - mx * my
+        vx = (sxx / nn_ - mx * mx).clamp_min(0.0)
+        vy = (syy / nn_ - my * my).clamp_min(0.0)
+        corr = cov / torch.sqrt(vx * vy + self.eps)
+        eye = torch.eye(C, dtype=torch.bool, device=x.device).view(1, C, C)
+        ok = (n >= self.min_pairs) & (vy > self.eps) & ~eye
+        score = torch.where(ok, corr.abs(), torch.full_like(corr, -1.0))
+        k = min(self.k, C - 1)
+        sc, idx = score.topk(k, dim=-1)  # (B, C, k)
+        slope = torch.gather(cov / vy.clamp_min(self.eps), 2, idx)
+        inter = torch.gather(mx, 2, idx) - slope * torch.gather(my, 2, idx)
+        flat = idx.reshape(B, 1, C * k).expand(B, L, C * k)
+        xp = torch.gather(x, 2, flat).reshape(B, L, C, k)
+        mp = torch.gather(M.to(torch.uint8), 2, flat).reshape(B, L, C, k).bool()
+        valid = mp & (sc > 0).unsqueeze(1)
+        pred = inter.unsqueeze(1) + slope.unsqueeze(1) * xp
+        c4 = torch.nanmedian(torch.where(valid, pred, torch.full_like(pred, float('nan'))), dim=-1).values
+        avail = torch.isfinite(c4)
+        c4 = torch.where(avail, c4, fill)
+        best = sc[..., 0].clamp_min(0.0)
+        return c4, avail, best
+
+
+def loo_prior_multi(x, ctx, cands, avails, s, eps=0.05):
+    """Leave-one-out routing prior over K parameter-free experts (v6; v5 = K=2 via loo_prior).
+
+    cands / avails: lists of (B, L, C) candidates and availability masks, the first one (E2) always available.
+    ê_k(t) = median over the k nearest reliable anchors before and after t of |c_k(a) − x(a)| / s;
+    prior_k = −log(ê_k + eps); where ê_k is missing the expert gets the prior of the first expert (neutral);
+    if the first one is missing too, all priors are 0. Returns (prior (B, L, C, K), ê (B, L, C, K)), detached."""
+    B, L, C = x.shape
+    z = to_series(x.detach())
+    ss = to_series(s.expand(B, L, C))
+    p = torch.cat([ctx['pb'], ctx['pf']], dim=-1)
+    v = torch.cat([ctx['vb'], ctx['vf']], dim=-1)
+    S, _, K2 = p.shape
+    errs = []
+    for c, a in zip(cands, avails):
+        e = torch.where(to_series(a), (to_series(c.detach()) - z).abs() / ss, torch.full_like(z, float('nan')))
+        g = torch.gather(e, 1, p.reshape(S, -1)).reshape(S, L, K2)
+        g = torch.where(v, g, torch.full_like(g, float('nan')))
+        errs.append(torch.nanmedian(g, dim=-1).values)
+    ehat = torch.stack(errs, dim=-1)
+    pr = -torch.log(ehat + eps)
+    p0 = torch.where(torch.isfinite(pr[..., 0]), pr[..., 0], torch.zeros_like(pr[..., 0]))
+    pri = [p0] + [torch.where(torch.isfinite(pr[..., i]), pr[..., i], p0) for i in range(1, len(cands))]
+    return from_series(torch.stack(pri, dim=-1), B, C), from_series(ehat, B, C)
+
+
 def loo_prior(x, ctx, c2, c3, avail3, s, eps=0.05):
     """Leave-one-out routing prior of stage 1 (v5).
 

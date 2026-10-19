@@ -139,8 +139,8 @@ def diag_revin(exp, conds, split):
 def diag_experts(exp, conds, split):
     args = exp.args
     from exp.exp_radar import ckpt_paths, load_pre_state
-    from radar.modules import (LocalLinearExpert, LocalMedianExpert, PeriodicShapeExpert, ReliableNeighborExpert,
-                               reliable_context, robust_stats, to_series)
+    from radar.modules import (CrossChannelExpert, LocalLinearExpert, LocalMedianExpert, PeriodicShapeExpert,
+                               ReliableNeighborExpert, reliable_context, robust_stats, to_series)
     from radar.radar import resolve_e3_period
     paths = ckpt_paths(args)
     b0, _ = exp.load_method('B0', paths)
@@ -154,13 +154,15 @@ def diag_experts(exp, conds, split):
     e2_old = ReliableNeighborExpert(k=args.e2_k, thr=0.5, trend=False)
     e2 = LocalLinearExpert()
     e3 = PeriodicShapeExpert(T, args.seq_len, args.e3_cycles).to(dev)
+    e4 = CrossChannelExpert(k=getattr(args, 'e4_k', 3))
     med = LocalMedianExpert(3)
     names = ['no repair', 'local median', 'E2 v3 (median)', 'E2 v4 (linear)', 'E3 (periodic)', 'E3 else E2',
-             'best of E2/E3']
+             'best of E2/E3', 'E4 (cross-channel)', 'E4 else E2', 'best of E2/E3/E4']
     e1_name = None
     if W is not None:
-        e1_name = 'E1 refined (v5: stage 1 + residual)' if W.arch == 'v5' else 'E1 (Repairer)'
+        e1_name = f'E1 refined ({W.arch}: stage 1 + residual)' if W.arch in ('v5', 'v6') else 'E1 (Repairer)'
         names.append(e1_name)
+    only_avail = {'E3 (periodic)': 'a3', 'E4 (cross-channel)': 'a4'}  # MAE on the points where the expert exists
     H, fd = args.pred_len, exp.f_dim
     per = {}
     with torch.no_grad():
@@ -170,23 +172,27 @@ def diag_experts(exp, conds, split):
             ae = defaultdict(float)
             sq = defaultdict(float)
             fse = defaultdict(float)
-            n_pts, n_y, n_a3 = 0, 0, 0
+            n_pts, n_y, n_a3, n_a4 = 0, 0, 0, 0
             for x, x_p, changed, y, c in exp.perturbed_batches(cond, split):
                 R = (~changed).to(x.dtype)  # oracle reliability
                 ctx = reliable_context(to_series(R) > 0.5, args.e2_k)
                 c2 = e2(x_p, ctx)
                 c3, a3, _ = e3(x_p, ctx, fill=c2)
+                c4, a4, _ = e4(x_p, ~changed, fill=c2)
                 cands = {'no repair': x_p, 'local median': med(x_p), 'E2 v3 (median)': e2_old(x_p, R),
-                         'E2 v4 (linear)': c2, 'E3 (periodic)': c3, 'E3 else E2': torch.where(a3, c3, c2)}
-                best = torch.where((c3 - x).abs() < (c2 - x).abs(), c3, c2)
-                cands['best of E2/E3'] = torch.where(a3, best, c2)
+                         'E2 v4 (linear)': c2, 'E3 (periodic)': c3, 'E3 else E2': torch.where(a3, c3, c2),
+                         'E4 (cross-channel)': c4, 'E4 else E2': c4}
+                best = torch.where(a3 & ((c3 - x).abs() < (c2 - x).abs()), c3, c2)
+                cands['best of E2/E3'] = best
+                cands['best of E2/E3/E4'] = torch.where(a4 & ((c4 - x).abs() < (best - x).abs()), c4, best)
+                masks = {'a3': a3, 'a4': a4}
                 if W is not None:
                     cands[e1_name] = W.repairer_candidate(x_p, R)
                 _, sc = robust_stats(x)
                 sc = sc.expand_as(x)
                 yy = y[:, -H:, fd:]
                 for nm, cv in cands.items():
-                    msk = changed & a3 if nm == 'E3 (periodic)' else changed
+                    msk = changed & masks[only_avail[nm]] if nm in only_avail else changed
                     e = ((cv - x).abs() / sc)[msk]
                     ae[nm] += e.sum().item()
                     sq[nm] += (e ** 2).sum().item()
@@ -197,17 +203,18 @@ def diag_experts(exp, conds, split):
                     fse['oracle clean'] += ((b0(x, c)[:, -H:, fd:] - yy) ** 2).sum().item()
                 n_pts += int(changed.sum().item())
                 n_a3 += int((changed & a3).sum().item())
+                n_a4 += int((changed & a4).sum().item())
                 n_y += yy.numel()
-            r = dict(n_changed=n_pts, e3_avail=n_a3 / max(n_pts, 1))
+            r = dict(n_changed=n_pts, e3_avail=n_a3 / max(n_pts, 1), e4_avail=n_a4 / max(n_pts, 1))
             for nm in names:
-                nn_ = n_a3 if nm == 'E3 (periodic)' else n_pts
+                nn_ = {'E3 (periodic)': n_a3, 'E4 (cross-channel)': n_a4}.get(nm, n_pts)
                 r[nm] = dict(mae=ae[nm] / max(nn_, 1), rmse=float(np.sqrt(sq[nm] / max(nn_, 1))),
                              fcst_mse=fse[nm] / n_y if b0 is not None else float('nan'))
             if b0 is not None:
                 r['oracle clean'] = dict(fcst_mse=fse['oracle clean'] / n_y)
             per[cond] = r
             print(f'  {cond:20s} ' + ' | '.join(f'{nm} {r[nm]["mae"]:.3f}' for nm in names)
-                  + f' | E3 avail {100 * r["e3_avail"]:.0f}%')
+                  + f' | E3 avail {100 * r["e3_avail"]:.0f}% | E4 avail {100 * r["e4_avail"]:.0f}%')
     md = []
     g2, g3 = _groups(conds)
 
@@ -220,13 +227,14 @@ def diag_experts(exp, conds, split):
         if key == 'fcst_mse' and b0 is None:
             continue
         md.append(f'### Experts — {title}; E3 period T = {T}' + (' (E3 unavailable: T ≥ L)' if not e3.enabled else ''))
-        hdr = ['Type', 'Position'] + names + (['clean input'] if key == 'fcst_mse' else []) + ['E3 avail']
+        hdr = ['Type', 'Position'] + names + (['clean input'] if key == 'fcst_mse' else []) + ['E3 avail', 'E4 avail']
         rows = []
         for (t, p), cs in g2.items():
             row = [t, p] + [_f(avg(cs, nm, key), 3) for nm in names]
             if key == 'fcst_mse':
                 row.append(_f(float(np.mean([per[c]['oracle clean']['fcst_mse'] for c in cs])), 3))
             row.append(_pct(float(np.mean([per[c]['e3_avail'] for c in cs]))))
+            row.append(_pct(float(np.mean([per[c]['e4_avail'] for c in cs]))))
             rows.append(row)
         _table(md, hdr, rows)
     md.append('### Experts — repair MAE by length')

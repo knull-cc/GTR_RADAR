@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# RADAR v4 diagnostics (validation split, seed 2024, pred_len 96 unless PRED_LENS / SEEDS are set).
+# RADAR diagnostics (validation split, seed 2024, pred_len 96 unless PRED_LENS / SEEDS are set).
 #   bash scripts/RADAR/run_step.sh revin   ETTh1 [more datasets]   # step 1: RevIN 2×2 on B0
 #   bash scripts/RADAR/run_step.sh experts ETTh1                   # step 2: offline expert repair errors
 #   bash scripts/RADAR/run_step.sh det     ETTh1                   # step 3: S2 + detector AUROC (v4 features)
 #   DET_FEATS=v3 bash scripts/RADAR/run_step.sh det ETTh1          #         the same with the v3 features
-# Results: results_radar_v5/diag/<setting>__<step>.md / .json
+# Results: results_radar_v6/diag/<setting>__<step>.md / .json
 set -eo pipefail
 step=${1:?usage: run_step.sh revin|experts|det DATASET...}
 shift

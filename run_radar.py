@@ -7,7 +7,7 @@ commands:
   train_aug       S1  fine-tune backbone with the RADAR v4 augmentation mixture (control)    -> aug_v4.pth
   pretrain_radar  S2  frozen backbone, RADAR only (L_det + L_rec)                            -> pre_<arch>.pth
   train_radar     S3  joint training, full loss (add --freeze_backbone for the plug-in)      -> radar_ / plugin_<arch>.pth
-  eval                B0, B1 (GTR+Aug), B2 (Hampel), Ours-plugin [+ Ours, Ours-argmax] x the v4 test grid
+  eval                B0, B1 (GTR+Aug), B2 (Hampel), Ours-plugin [+ Ours, Ours-argmax, Ours-oracle] x the test grid
   summarize           <results_dir>/raw/*.json -> summary.csv / summary_extras.csv / summary.md
   plot                figures (dependency profiles, example windows)
   repro_check         compare S0 test MSE with the original run.py (see run_orig.py)
@@ -114,11 +114,19 @@ def build_parser():
     g.add_argument('--gate_eps', type=float, default=1e-2, help='ε in log(D̃ + ε)')
     g.add_argument('--scale_std_frac', type=float, default=0.1, help='robust scale floor: frac * window std')
     g.add_argument('--scale_min', type=float, default=1e-2, help='robust scale absolute floor')
-    g.add_argument('--arch', type=str, default='v5', choices=['v5', 'v4'],
-                   help='v5: E2/E3 selection with a leave-one-out prior + residual E1 + consistency gate; '
+    g.add_argument('--arch', type=str, default='v6', choices=['v6', 'v5', 'v4'],
+                   help='v6: v5 + cross-channel expert E4 + segment-level gate + forecast-space mixing; '
+                        'v5: E2/E3 selection with a leave-one-out prior + residual E1 + consistency gate; '
                         'v4: three competing experts (E1, E2, E3)')
     g.add_argument('--gate_consistency', type=int, default=-1,
-                   help='gate term softplus(g)*log(1+|c-x|/s): 1 on, 0 off, -1 = on for v5 / off for v4')
+                   help='gate term softplus(g)*log(1+|c-x|/s): 1 on, 0 off, -1 = on for v5/v6, off for v4')
+    g.add_argument('--seg_gate', type=int, default=-1,
+                   help='segment-level gate: every point of a suspicious run takes the run maximum of the gate '
+                        'logit (isolated false alarms stay closed, real bad runs are repaired as a whole); '
+                        '1 on, 0 off, -1 = on for v6 only')
+    g.add_argument('--fc_mix', type=int, default=-1,
+                   help='forecast-space mixing ŷ = (1-ρ) f(x) + ρ f(x̃), ρ = max_t α per channel (two backbone '
+                        'passes); 1 on, 0 off, -1 = on for v6 only')
     g.add_argument('--gate_g_init', type=float, default=1.0, help='initial softplus(g) of the consistency term')
     g.add_argument('--det_feats', type=str, default='v4', choices=['v4', 'v3'],
                    help='detector point features: v4 = u, du, |u-med5|, |u-med17|, MAD5 (shifted windows); v3 = 3')
@@ -129,7 +137,10 @@ def build_parser():
                    help='E3 period T in steps (daily period of the dataset); -1 = --cycle; 0 = off. '
                         'E3 is unavailable when T >= seq_len')
     g.add_argument('--e3_cycles', type=int, default=3, help='E3 template: same-phase points t ± jT, j = 1..n')
-    g.add_argument('--experts', type=str, default='e1,e2,e3', help='enabled experts (e1 required), e.g. e1,e2')
+    g.add_argument('--experts', type=str, default='auto',
+                   help="enabled experts (e1 required), e.g. e1,e2; 'auto' = e1,e2,e3,e4 for v6, e1,e2,e3 otherwise")
+    g.add_argument('--e4_k', type=int, default=3,
+                   help='E4 (cross-channel): reliable partner channels with the largest |corr| in the window')
     g.add_argument('--router', type=str, default='linear', choices=['linear', 'h'],
                    help='linear: named per-point features (interpretable); h: v3 Router on the Repairer state')
     g.add_argument('--lam_route', type=float, default=0.5,
@@ -165,6 +176,10 @@ def build_parser():
     g.add_argument('--gate_b_init', type=float, default=1.0, help='initial softplus(b)')
     g.add_argument('--tau_calib_frac', type=float, default=0.01,
                    help='stage B: init τ so this fraction of clean train points has α>0.5 (0 = off)')
+    g.add_argument('--tau_calib_wfrac', type=float, default=0.05,
+                   help='v6 (segment gate / forecast mixing): init τ so this fraction of clean train '
+                        '(window, channel) pairs is repaired; --tau_calib_frac then sets the run-extension '
+                        'threshold of the segment gate')
     g.add_argument('--tau_calib_batches', type=int, default=20)
     g.add_argument('--bb_lr_scale', type=float, default=0.1, help='backbone lr = scale * script lr (S1, S3)')
     g.add_argument('--ft_epochs', type=int, default=10, help='S1/S3 max epochs')
@@ -181,7 +196,8 @@ def build_parser():
     g.add_argument('--ckpt_tag', type=str, default='', help='extra tag appended to the RADAR checkpoint names')
     g.add_argument('--skip_existing', type=int, default=0, help='skip a training stage if its checkpoint exists')
     g.add_argument('--methods', type=str, default='B0,B1,B2,Ours-plugin',
-                   help='add Ours (joint-training ablation) or Ours-argmax (plug-in with hard routing)')
+                   help='add Ours (joint-training ablation), Ours-argmax (plug-in with hard routing) or '
+                        'Ours-oracle (plug-in with a perfect gate: diagnostic upper bound)')
     g.add_argument('--conditions', type=str, default='grid',
                    help="'grid' = the v4 test grid (--test_grid), or a comma list of condition names "
                         "(e.g. zero_tail_k4_c100; legacy T1_raw, T2_k4, T3_flat ...)")
@@ -191,8 +207,8 @@ def build_parser():
     g.add_argument('--grid_seed', type=int, default=20261019, help='seed of the test-grid perturbations')
     g.add_argument('--diag_split', type=str, default='val', choices=['val', 'test'], help='split of diag_v4.py')
     g.add_argument('--radar_ckpt_dir', type=str, default='./checkpoints_radar/')
-    g.add_argument('--results_dir', type=str, default='./results_radar_v5/')
-    g.add_argument('--fig_dir', type=str, default='./figures_radar_v5/')
+    g.add_argument('--results_dir', type=str, default='./results_radar_v6/')
+    g.add_argument('--fig_dir', type=str, default='./figures_radar_v6/')
     g.add_argument('--plot_datasets', type=str, default='ETTh1,weather')
     g.add_argument('--n_examples', type=int, default=3)
     g.add_argument('--plot_conditions', type=str, default='zero_tail_k4_c100,flat_int_k8_c100',

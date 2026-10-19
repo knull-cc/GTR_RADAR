@@ -1,6 +1,14 @@
 """RADARWrapper: dependency-aware input repair placed *before* the backbone (and thus before its RevIN).
 
-v5 (default, `--arch v5`): select, then refine
+v6 (default, `--arch v6`) = v5 plus
+    * E4 cross-channel expert in stage 1 (the k most correlated reliable channels, per-window linear fit);
+    * segment gate: points whose logit z exceeds τ − δ form runs; every point of a run takes the run's maximum
+      logit, so a run is repaired as a whole and isolated weak alarms never fire (hysteresis thresholds);
+      τ is calibrated to a window-level false-repair budget, δ = τ − (point-level threshold);
+    * forecast-space mixing: ŷ = (1 − ρ) f(x) + ρ f(x̃), ρ = max_t α_t per window and channel, x̃ repairs the
+      runs with α ≥ 0.5 completely (uncertain windows average the two forecasts instead of half-repairing x).
+
+v5 (`--arch v5`): select, then refine
     x ─ RobustScaler ─┬─ ReliabilityNet(5 point features) → ℓ, R = 1 − σ(ℓ)                       stage A (S2)
                       ├─ stage 1  E2 local linear | E3 periodic shape  (parameter-free)
                       │           π = softmax( −log ê_k  +  wᵀφ )      ê_k: leave-one-out error of expert k on the
@@ -22,13 +30,15 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from radar.dependency import DependencyProfile, hutchinson_dependency, patch_sum
-from radar.modules import (N_POINT_FEATURES, ROUTE_FEATURES, ROUTE_FEATURES_V5, LinearRouter, LocalLinearExpert,
-                           PeriodicShapeExpert, ReliabilityNet, Repairer, Router, from_patches, from_series,
-                           loo_prior, patch_to_points, point_features, reliable_context, robust_stats,
-                           route_features, route_features_v5, to_patches, to_series)
+from radar.modules import (N_POINT_FEATURES, ROUTE_FEATURES, ROUTE_FEATURES_V5, ROUTE_FEATURES_V6, CrossChannelExpert,
+                           LinearRouter, LocalLinearExpert, PeriodicShapeExpert, ReliabilityNet, Repairer, Router,
+                           from_patches, from_series, loo_prior, loo_prior_multi, patch_to_points, point_features,
+                           reliable_context, robust_stats, route_features, route_features_v5, route_features_v6,
+                           to_patches, to_series)
 
 EXPERTS = ('Repairer', 'LocalLinear', 'PeriodicShape')
-EXPERT_KEYS = ('e1', 'e2', 'e3')
+EXPERT_KEYS = ('e1', 'e2', 'e3', 'e4')
+ARCHS = ('v4', 'v5', 'v6')
 
 
 def _cfg(cfg, key, default):
@@ -49,10 +59,38 @@ def resolve_e3_period(cfg):
     return int(_cfg(cfg, 'cycle', 0)) if p < 0 else p
 
 
+def _auto_flag(cfg, key, default):
+    v = int(_cfg(cfg, key, -1))
+    return bool(default) if v < 0 else bool(v)
+
+
 def resolve_gate_consistency(cfg):
-    """--gate_consistency: 1 / 0, or -1 (default) = on for v5, off for v4."""
-    gc = int(_cfg(cfg, 'gate_consistency', -1))
-    return (str(_cfg(cfg, 'arch', 'v5')) == 'v5') if gc < 0 else bool(gc)
+    """--gate_consistency: 1 / 0, or -1 (default) = on for v5 / v6, off for v4."""
+    return _auto_flag(cfg, 'gate_consistency', str(_cfg(cfg, 'arch', 'v6')) in ('v5', 'v6'))
+
+
+def resolve_experts(cfg):
+    """--experts: comma list, or 'auto' (default) = e1,e2,e3,e4 for v6 and e1,e2,e3 otherwise."""
+    e = str(_cfg(cfg, 'experts', 'auto')).strip().lower()
+    if e in ('', 'auto'):
+        e = 'e1,e2,e3,e4' if str(_cfg(cfg, 'arch', 'v6')) == 'v6' else 'e1,e2,e3'
+    return [k.strip() for k in e.split(',') if k.strip()]
+
+
+def segment_max(z, inrun):
+    """z, inrun: (B, L, C). Every point of a run of consecutive inrun points (along time, per series) takes the
+    maximum z of its run; points outside runs keep their own z. Differentiable w.r.t. z (max sub-gradient)."""
+    B, L, C = z.shape
+    zs, rs = to_series(z), to_series(inrun)
+    S = zs.shape[0]
+    prev = torch.cat([torch.zeros_like(rs[:, :1]), rs[:, :-1]], dim=1)
+    seg = torch.cumsum((rs & ~prev).long(), dim=1)  # run number 1.. inside each series (0 before the first run)
+    gid = torch.arange(S, device=z.device).view(S, 1) * (L + 1) + torch.where(rs, seg, torch.zeros_like(seg))
+    flat = gid.reshape(-1)
+    init = torch.full((S * (L + 1),), -1e4, dtype=zs.dtype, device=z.device)
+    smax = init.scatter_reduce(0, flat, zs.reshape(-1), reduce='amax', include_self=False)
+    zr = smax.gather(0, flat).reshape(S, L)
+    return from_series(torch.where(rs, zr, zs), B, C)
 
 
 class RADARWrapper(nn.Module):
@@ -64,9 +102,10 @@ class RADARWrapper(nn.Module):
         self.P = int(_cfg(cfg, 'radar_patch', 8))
         self.N = math.ceil(self.seq_len / self.P)
         self.pad = self.N * self.P - self.seq_len
-        self.arch = str(_cfg(cfg, 'arch', 'v5'))
-        assert self.arch in ('v4', 'v5'), self.arch
-        v5 = self.arch == 'v5'
+        self.arch = str(_cfg(cfg, 'arch', 'v6'))
+        assert self.arch in ARCHS, self.arch
+        v6 = self.arch == 'v6'
+        v5 = self.arch in ('v5', 'v6')  # select-then-refine family
 
         d = int(_cfg(cfg, 'radar_d', 64))
         heads = int(_cfg(cfg, 'radar_heads', 4))
@@ -85,19 +124,27 @@ class RADARWrapper(nn.Module):
         self.neighbor = LocalLinearExpert()
         self.e3_period = resolve_e3_period(cfg)
         self.periodic = PeriodicShapeExpert(self.e3_period, self.seq_len, int(_cfg(cfg, 'e3_cycles', 3)))
+        self.cross = CrossChannelExpert(k=int(_cfg(cfg, 'e4_k', 3)))
         self.std_frac = float(_cfg(cfg, 'scale_std_frac', 0.1))
         self.s_min = float(_cfg(cfg, 'scale_min', 1e-2))
         self.u_clip = float(_cfg(cfg, 'u_clip', 10.0))
 
         # ---- experts / Router
-        keys = [k.strip().lower() for k in str(_cfg(cfg, 'experts', 'e1,e2,e3')).split(',') if k.strip()]
+        keys = resolve_experts(cfg)
         assert 'e1' in keys and set(keys) <= set(EXPERT_KEYS), f'--experts must contain e1, got {keys}'
+        assert v6 or 'e4' not in keys, 'E4 (cross-channel) exists in v6 only'
         if v5:
-            assert 'e2' in keys, 'v5 routes between E2 and E3: --experts must contain e2'
+            assert 'e2' in keys, 'v5/v6 stage 1 needs E2: --experts must contain e2'
         self.register_buffer('expert_enabled', torch.tensor([k in keys for k in EXPERT_KEYS]), persistent=False)
         self.router_type = str(_cfg(cfg, 'router', 'linear'))
         assert self.router_type in ('linear', 'h'), self.router_type
-        if v5:
+        if v6:
+            assert self.router_type == 'linear', 'v6 uses the linear stage-1 Router'
+            self.expert_names = ('LocalLinear', 'PeriodicShape', 'CrossChannel')  # routed experts (π)
+            self.cand_names = ('Refined', 'LocalLinear', 'PeriodicShape', 'CrossChannel')
+            self.route_feature_names = ROUTE_FEATURES_V6
+            self.router = LinearRouter(len(ROUTE_FEATURES_V6), 3)
+        elif v5:
             assert self.router_type == 'linear', 'v5 uses the linear stage-1 Router'
             self.expert_names = ('LocalLinear', 'PeriodicShape')  # routed experts (π)
             self.cand_names = ('Refined', 'LocalLinear', 'PeriodicShape')  # c[..., k]: final, E2, E3
@@ -123,6 +170,13 @@ class RADARWrapper(nn.Module):
         self.tau_raw = nn.Parameter(torch.tensor(float(_cfg(cfg, 'tau_init', 1.0))))
         self.gate_eps = float(_cfg(cfg, 'gate_eps', 1e-2))
         self.logit_clip = 12.0
+        # v6: segment gate (hysteresis; δ = τ − point-level threshold, calibrated) and forecast-space mixing
+        self.seg_gate = _auto_flag(cfg, 'seg_gate', v6)
+        self.fc_mix = _auto_flag(cfg, 'fc_mix', v6)
+        if self.seg_gate:  # registered only when used, so v4 / v5 checkpoints keep loading strictly
+            self.register_buffer('seg_delta', torch.tensor(2.0))
+        self.oracle_gate = False  # evaluation diagnostic: α = 1 exactly on the corrupted points
+        self.oracle_mask = None
 
         # ---- dependency
         self.dep_mode = str(_cfg(cfg, 'dep_mode', 'ema'))
@@ -156,6 +210,8 @@ class RADARWrapper(nn.Module):
                    route_temp=float(self.route_temp))
         if self.gate_consistency:
             out['g'] = float(F.softplus(self.gate_g))
+        if self.seg_gate:
+            out['seg_delta'] = float(self.seg_delta)
         return out
 
     def set_route_temp(self, value):
@@ -173,9 +229,11 @@ class RADARWrapper(nn.Module):
 
     @torch.no_grad()
     def gate_logit_without_tau(self, x, *bb_args):
-        """Gate logit + τ for every point (used to calibrate τ)."""
+        """Point-level gate logit z (before τ and before segment pooling) for every point (calibration of τ, δ)."""
+        if self.force_gate_zero:
+            return None
         _, aux = self.repair(x, *bb_args)
-        return aux['gate_logit'] + self.tau_raw if not self.force_gate_zero else None
+        return aux['gate_z']
 
     def stage_a_parameters(self):
         return list(self.reliability.parameters()) + list(self.repairer.parameters())
@@ -252,18 +310,29 @@ class RADARWrapper(nn.Module):
             return F.one_hot(logits.argmax(dim=-1), logits.shape[-1]).to(logits.dtype)
         return torch.softmax(logits, dim=-1)
 
-    # ---- v5 stage 1
+    # ---- v5 / v6 stage 1
     def stage1(self, x, R, s):
-        """Stage 1 (v5): E2 / E3 and π = softmax(−log ê + wᵀφ). Returns a dict (c_base keeps the Router gradient)."""
+        """Stage 1 (v5: E2 / E3; v6: E2 / E3 / E4) with π = softmax(−log ê + wᵀφ). Returns a dict; c_base keeps the
+        Router gradient, everything else is detached."""
         ctx, c2, c3, a3, spread3 = self._param_free(x, R)
-        prior, ehat = loo_prior(x, ctx, c2, c3, a3, s)
-        phi = route_features_v5(ctx, R, c2, c3, s, a3, spread3)
-        avail = torch.stack([torch.ones_like(a3), a3], dim=-1)
-        corr = self.router(phi)  # (B, L, C, 2), E2 = reference (0)
+        ones = torch.ones_like(a3)
+        if self.arch == 'v6':
+            c4, a4, corr4 = self.cross(x, R.detach() > self.e2_thr, fill=c2)
+            a4 = a4 & self.expert_enabled[3]
+            c4 = torch.where(a4, c4, c2)
+            cands, avails = [c2, c3, c4], [ones, a3, a4]
+            prior, ehat = loo_prior_multi(x, ctx, cands, avails, s)
+            phi = route_features_v6(ctx, R, c2, c3, c4, s, a3, a4, spread3, corr4)
+        else:
+            cands, avails = [c2, c3], [ones, a3]
+            prior, ehat = loo_prior(x, ctx, c2, c3, a3, s)
+            phi = route_features_v5(ctx, R, c2, c3, s, a3, spread3)
+        avail = torch.stack(avails, dim=-1)
+        corr = self.router(phi)  # (B, L, C, K), E2 = reference (0)
         pi = self._softmax_route(prior + corr, avail)
-        c_base = pi[..., 0] * c2 + pi[..., 1] * c3
-        return dict(ctx=ctx, c2=c2, c3=c3, a3=a3, prior=prior, ehat=ehat, phi=phi, corr=corr, avail=avail, pi=pi,
-                    c_base=c_base)
+        c_base = (pi * torch.stack(cands, dim=-1)).sum(dim=-1)
+        return dict(ctx=ctx, cands=cands, avails=avails, prior=prior, ehat=ehat, phi=phi, corr=corr, avail=avail,
+                    pi=pi, c_base=c_base)
 
     # ---- v4 routing
     def _route_v4(self, route_in, avail, B, C, pad):
@@ -276,7 +345,7 @@ class RADARWrapper(nn.Module):
     def route_candidate(self, aux):
         """Routed repair value recomputed with gradients reaching the Router only (used by L_route):
         v5: Σ_k π_k sg(c_k) + sg(Δ·s);  v4: Σ_k π_k sg(c_k)."""
-        if self.arch == 'v5':
+        if self.arch in ('v5', 'v6'):
             pi = self._softmax_route(aux['route_prior'] + self.router(aux['route_in'].detach()), aux['avail'])
             cand = aux['c'][..., 1:].detach()
             return (pi * cand).sum(dim=-1) + aux['delta_x'].detach()
@@ -285,7 +354,7 @@ class RADARWrapper(nn.Module):
 
     def route_probs(self, aux):
         """(kept for compatibility) π recomputed from the detached Router input."""
-        if self.arch == 'v5':
+        if self.arch in ('v5', 'v6'):
             return self._softmax_route(aux['route_prior'] + self.router(aux['route_in'].detach()), aux['avail'])
         return self._route_v4(aux['route_in'].detach(), aux['avail'], aux['B'], aux['C'], aux['pad'])
 
@@ -310,7 +379,7 @@ class RADARWrapper(nn.Module):
         up, pad = to_patches(uc, self.P)
         R = R.to(x.dtype)
         Rp, _ = to_patches(R, self.P)
-        if self.arch == 'v5':
+        if self.arch in ('v5', 'v6'):
             st = self.stage1(x, R, s)
             u_base = ((st['c_base'] - m) / s).clamp(-self.u_clip, self.u_clip)
             delta_p, _ = self._e1(Rp, up, u_base)
@@ -342,7 +411,7 @@ class RADARWrapper(nn.Module):
         R = from_patches(R_p, B, C, pad)
 
         aux = dict(logit=logit, R=R, m=m, s=s, B=B, C=C, pad=pad)
-        if self.arch == 'v5':
+        if self.arch in ('v5', 'v6'):
             R_in = from_patches(R_in_p, B, C, pad)
             st = self.stage1(x, R_in, s)
             u_base = ((st['c_base'] - m) / s).clamp(-self.u_clip, self.u_clip).detach()
@@ -350,13 +419,18 @@ class RADARWrapper(nn.Module):
             delta = from_patches(delta_p, B, C, pad)
             aux['u_hat'] = u_base + delta  # reconstruction target frame; stage 1 detached
             target = st['c_base'] + delta * s  # forecast path: Router gradient through c_base
-            cand = torch.stack([target, st['c2'], st['c3']], dim=-1)
-            lo_prior = (st['prior'][..., 1] - st['prior'][..., 0]) * st['a3']
-            lo_corr = (st['corr'][..., 1] - st['corr'][..., 0]) * st['a3']
+            cand = torch.stack([target] + st['cands'], dim=-1)
+            av = st['avail'].to(x.dtype)
+            if self.arch == 'v6':  # log-odds of E3 and E4 vs E2 (vector), 0 where unavailable
+                lo_prior = (st['prior'][..., 1:] - st['prior'][..., :1]) * av[..., 1:]
+                lo_corr = (st['corr'][..., 1:] - st['corr'][..., :1]) * av[..., 1:]
+            else:
+                lo_prior = (st['prior'][..., 1] - st['prior'][..., 0]) * av[..., 1]
+                lo_corr = (st['corr'][..., 1] - st['corr'][..., 0]) * av[..., 1]
             aux.update(pi=st['pi'], c=cand, avail=st['avail'], route_in=st['phi'], route_prior=st['prior'],
                        ehat=st['ehat'], delta_u=delta, delta_x=delta * s, route_lo_prior=lo_prior,
                        route_lo_corr=lo_corr, gap=from_series(st['ctx']['gap'], B, C),
-                       cand_avail=torch.stack([torch.ones_like(st['a3']), torch.ones_like(st['a3']), st['a3']], -1))
+                       cand_avail=torch.cat([torch.ones_like(st['avail'][..., :1]), st['avail']], dim=-1))
             if not need_route:
                 aux.update(x_tilde=x, alpha=torch.zeros_like(x), target=target)
                 self.last_aux = aux
@@ -382,24 +456,45 @@ class RADARWrapper(nn.Module):
 
         Dt_p = self.compute_dependency(x, f) if compute_dep else x.new_ones(B, C, self.N)
         Dt = patch_to_points(Dt_p, self.P, pad)  # (B, L, C)
+        z = (F.softplus(self.gate_a) * logit.clamp(-self.logit_clip, self.logit_clip)
+             + F.softplus(self.gate_b) * torch.log(Dt + self.gate_eps))
+        if self.gate_consistency:  # reconstruction-consistency evidence (repair detached)
+            z = z + F.softplus(self.gate_g) * torch.log1p((target.detach() - x).abs() / s)
+        oracle = self.oracle_gate and self.oracle_mask is not None
         if self.force_gate_zero:
             gate_logit = torch.full_like(x, -float('inf'))
             alpha = torch.zeros_like(x)
-            x_tilde = x
+        elif oracle:  # diagnostic: perfect gate on the corrupted points
+            alpha = self.oracle_mask.to(x.dtype)
+            gate_logit = torch.where(alpha > 0.5, torch.full_like(x, 30.0), torch.full_like(x, -30.0))
         else:
-            gate_logit = (F.softplus(self.gate_a) * logit.clamp(-self.logit_clip, self.logit_clip)
-                          + F.softplus(self.gate_b) * torch.log(Dt + self.gate_eps) - self.tau_raw)
-            if self.gate_consistency:  # reconstruction-consistency evidence (repair detached)
-                gate_logit = gate_logit + F.softplus(self.gate_g) * torch.log1p((target.detach() - x).abs() / s)
+            zeff = segment_max(z, (z > self.tau_raw - self.seg_delta).detach()) if self.seg_gate else z
+            gate_logit = zeff - self.tau_raw
             alpha = torch.sigmoid(gate_logit)
+        if self.fc_mix and not self.force_gate_zero:
+            hard = (alpha >= 0.5).to(x.dtype).detach()  # runs with α ≥ 0.5 are repaired completely
+            x_tilde = x + hard * (target - x)
+            rho = alpha.amax(dim=1)  # (B, C) probability that this window/channel needs the repair
+            aux['rho'] = rho
+        else:
             x_tilde = x + alpha * (target - x)
 
-        aux.update(alpha=alpha, gate_logit=gate_logit, dbar=Dt, dbar_patch=Dt_p, x_tilde=x_tilde, target=target)
+        aux.update(alpha=alpha, gate_logit=gate_logit, gate_z=z.detach(), dbar=Dt, dbar_patch=Dt_p, x_tilde=x_tilde,
+                   target=target)
         self.last_aux = aux
         return x_tilde, aux
 
     def forward(self, x, *bb_args, rec_mask=None, compute_dep=True, run_backbone=True):
-        x_tilde, _ = self.repair(x, *bb_args, rec_mask=rec_mask, compute_dep=compute_dep)
+        x_tilde, aux = self.repair(x, *bb_args, rec_mask=rec_mask, compute_dep=compute_dep)
         if not run_backbone:
             return None
-        return _first(self.backbone(x_tilde, *bb_args))
+        if 'rho' not in aux:
+            return _first(self.backbone(x_tilde, *bb_args))
+        # forecast-space mixing: one backbone call on [x; x̃]
+        B = x.shape[0]
+        args2 = [torch.cat([a, a], dim=0) if torch.is_tensor(a) and a.shape[:1] == (B,) else a for a in bb_args]
+        y = _first(self.backbone(torch.cat([x, x_tilde], dim=0), *args2))
+        y0, y1 = y[:B], y[B:]
+        rho = aux['rho']
+        w = rho.unsqueeze(1) if y.shape[-1] == rho.shape[-1] else rho.amax(dim=-1).view(B, 1, 1)
+        return y0 + w * (y1 - y0)

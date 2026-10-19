@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# Shared RADAR v4 pipeline, sourced by scripts/RADAR/<dataset>.sh.
+# Shared RADAR pipeline (default architecture v6), sourced by scripts/RADAR/<dataset>.sh.
 # The dataset script defines: model_name root_path_name data_path_name model_id_name data_name seq_len cycle
 #                             e3_period GTR_ARGS
 #
 # Environment knobs:
 #   MODE=full        S0 -> S1 (GTR+Aug) -> S2 -> S3 plug-in -> eval on the test grid (default)
 #   MODE=revin       step 1: S0 (reused if base.pth exists) + RevIN 2×2 diagnostic on B0   (diag_v4.py revin)
-#   MODE=experts     step 2: offline expert repair errors (+ E1 if pre_v4.pth exists)       (diag_v4.py experts)
+#   MODE=experts     step 2: offline expert repair errors (+ E1 if pre_<arch>.pth exists)   (diag_v4.py experts)
 #   MODE=det         step 3: S0 + S2 + detector AUROC per condition                         (diag_v4.py det)
-#                    DET_FEATS=v3 evaluates the v3-feature detector (separate checkpoint pre_v4_detv3.pth)
+#                    DET_FEATS=v3 evaluates the v3-feature detector (separate checkpoint pre_<arch>_detv3.pth)
 #   MODE=eval        evaluation only (checkpoints must exist); METHODS="B0,B1,B2,Ours-plugin" by default.
-#                    e.g. ARCH=v4 METHODS=Ours-plugin MODE=eval adds the v4 plug-in as Ours-plugin-v4
+#                    e.g. ARCH=v5 METHODS=Ours-plugin MODE=eval adds the v5 plug-in as Ours-plugin-v5
 #   MODE=diag        v3 clean-headroom audit (diag_clean.py)
 #   QUICK=1          pred_len 96, seed 2024, plus the original run.py reproduction check (REPRO=1)
 #   PRED_LENS="..."  SEEDS="..."   override the grid (default: 96 192 336 720 x 2024)
@@ -21,9 +21,10 @@
 #   RADAR_ARGS="..." extra RADAR-only args (e.g. "--test_grid main", "--router h", "--experts e1,e2")
 #   ABLATION=1       also train/evaluate Ours (joint training, backbone fine-tuned) as an ablation
 #   ARGMAX=1         also evaluate the plug-in with hard (argmax) routing (Ours-argmax)
+#   ORACLE=1         also evaluate the plug-in with a perfect gate (Ours-oracle, upper bound of the gate)
 #   SKIP_EXISTING=1  reuse checkpoints that already exist (default 1; set 0 to retrain)
-#   PY=python  LOG_DIR=./logs_radar_v5  RESULTS_DIR=./results_radar_v5/  CKPT_DIR=./checkpoints_radar/
-#   ARCH=v4          run the v4 architecture instead of v5 (its RADAR results are recorded as Ours-plugin-v4)
+#   PY=python  LOG_DIR=./logs_radar_v6  RESULTS_DIR=./results_radar_v6/  CKPT_DIR=./checkpoints_radar/
+#   ARCH=v5|v4       run an earlier architecture instead of v6 (its RADAR results are recorded as Ours-plugin-v5 ...)
 set -eo pipefail
 
 QUICK=${QUICK:-0}
@@ -37,9 +38,10 @@ fi
 REPRO_STRICT=${REPRO_STRICT:-1}
 ABLATION=${ABLATION:-0}
 ARGMAX=${ARGMAX:-0}
+ORACLE=${ORACLE:-0}
 PY=${PY:-python}
-LOG_DIR=${LOG_DIR:-./logs_radar_v5}
-RESULTS_DIR=${RESULTS_DIR:-./results_radar_v5/}
+LOG_DIR=${LOG_DIR:-./logs_radar_v6}
+RESULTS_DIR=${RESULTS_DIR:-./results_radar_v6/}
 CKPT_DIR=${CKPT_DIR:-./checkpoints_radar/}
 SKIP_EXISTING=${SKIP_EXISTING:-1}
 EXTRA_ARGS=${EXTRA_ARGS:-}
@@ -91,6 +93,7 @@ run_one() {
   $PY -u run_radar.py train_radar    "${common[@]}" --freeze_backbone 2>&1 | tee "${log}__S3plugin.log"
   local methods="B0,B1,B2,Ours-plugin"
   if [ "$ARGMAX" = "1" ]; then methods="$methods,Ours-argmax"; fi
+  if [ "$ORACLE" = "1" ]; then methods="$methods,Ours-oracle"; fi
   if [ "$ABLATION" = "1" ]; then  # joint training (backbone also fine-tuned) = ablation only
     $PY -u run_radar.py train_radar  "${common[@]}" 2>&1 | tee "${log}__S3.log"
     methods="$methods,Ours"
