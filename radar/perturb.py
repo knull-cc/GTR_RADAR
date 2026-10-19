@@ -17,6 +17,20 @@ Per batch, the random draws come from rng([seed, crc32(condition), batch index])
 same perturbed windows. The training mixture (MixturePerturber) uses the same corruption functions.
 Legacy names are still accepted: T1_raw = zero_tail_k1_c100, T2_k{k} = zero_tail_k{k}_c100,
 T3_flat = flat_tail_k8_c100, T1_scaled = last point set to 0 in scaled space.
+
+TameR protocol (ICML 2026, "Taming the Recent-Data Bias", Appendix E.3): 7 scenarios, each test window perturbed
+independently, every channel, δ ~ N(0, (α·σ_hist)²) with σ_hist = per-window, per-channel std (ddof 0), α = 3:
+    tamer_re_sap  recent single anomalous point     x_L      += δ
+    tamer_re_cas  recent continuous anomalous seq.  x_t      += δ_t,  t = L−n+1..L,   n ~ U{2..5}
+    tamer_re_smp  recent single missing point       x_L       = raw 0 (physical zero, = T1_raw)
+    tamer_ra_sap  random single anomalous point     x_t      += δ,    t ~ U{1..L}
+    tamer_ra_cas  random continuous anomalous seq.  x_t      += δ_t,  t = s..s+n−1,   n ~ U{2..5}, s ~ U{1..L−n+1}
+    tamer_ra_smp  random single missing point       x_t       = raw 0, t ~ U{1..L}
+    tamer_ra_map  random multiple anomalous points  x_tk     += δ_k,  K ~ U{2..5} distinct points
+The positions are shared by the channels of a window, δ is drawn per point and channel. A suffix _r<α> changes α
+(e.g. tamer_re_sap_r1 = the paper's "noise" level, _r0p5 = 0.5). The official code release only implements SAP
+(perturb_type last / random); tamer_last_r<α> / tamer_random_r<α> are kept as aliases of tamer_re_sap / tamer_ra_sap.
+None of these is used to train RADAR (the mixture has zero / flat / N(0, σ²) noise segments / U(3, 6)·σ spikes).
 """
 import math
 import re
@@ -30,12 +44,19 @@ OOD_TYPES = ('shift',)  # held out from training
 POSITIONS = ('tail', 'int')
 GRID_LENGTHS = {'zero': (1, 4, 8), 'flat': (1, 4, 8), 'noise': (8, 16), 'spike': (1, 2, 3), 'shift': (4, 8)}
 CHANNEL_RATIOS = (100, 50)
-TYPE_LABEL = {'zero': 'Zero', 'flat': 'Flat', 'noise': 'Noise', 'spike': 'Spike', 'shift': 'Shift (OOD)'}
-POS_LABEL = {'tail': 'Tail', 'int': 'Internal'}
+TAMER_TYPES = ('sap', 'cas', 'smp', 'map')  # TameR protocol (test only)
+TAMER_POSITIONS = ('re', 'ra')
+TYPE_LABEL = {'zero': 'Zero', 'flat': 'Flat', 'noise': 'Noise', 'spike': 'Spike', 'shift': 'Shift (OOD)',
+              'sap': 'SAP', 'cas': 'CAS', 'smp': 'SMP', 'map': 'MAP'}
+POS_LABEL = {'tail': 'Tail', 'int': 'Internal', 're': 'Recent', 'ra': 'Random'}
+TAMER_CONDITIONS = ('tamer_re_sap', 'tamer_re_cas', 'tamer_re_smp',
+                    'tamer_ra_sap', 'tamer_ra_cas', 'tamer_ra_smp', 'tamer_ra_map')
 
 LEGACY_CONDITIONS = ('T1_raw', 'T1_scaled', 'T2_k4', 'T2_k8', 'T3_flat')
 _LEGACY_MAP = {'T1_raw': ('zero', 'tail', 1, 100), 'T3_flat': ('flat', 'tail', 8, 100)}
 _COND_RE = re.compile(r'^(zero|flat|noise|spike|shift)_(tail|int)_k(\d+)_c(\d+)$')
+_TAMER_RE = re.compile(r'^tamer_(re|ra)_(sap|cas|smp|map)(?:_r(\d+(?:p\d+)?))?$')
+_TAMER_ALIAS_RE = re.compile(r'^tamer_(last|random)_r(\d+(?:p\d+)?)$')
 
 
 def grid_conditions(grid='full', ood=True):
@@ -66,6 +87,17 @@ def parse_condition(cond):
         return dict(type='zero', pos='tail', k=int(cond[len('T2_k'):]), ratio=100)
     if cond == 'T1_scaled':
         return dict(type='zero_scaled', pos='tail', k=1, ratio=100)
+    m = _TAMER_ALIAS_RE.match(cond)
+    if m is not None:
+        return dict(type='sap', pos='re' if m.group(1) == 'last' else 'ra', k=1, ratio=100,
+                    mag=float(m.group(2).replace('p', '.')))
+    m = _TAMER_RE.match(cond)
+    if m is not None:
+        if m.group(1) == 're' and m.group(2) == 'map':
+            raise ValueError('tamer_re_map is not defined (TameR excludes recent multiple points)')
+        mag = 3.0 if m.group(3) is None else float(m.group(3).replace('p', '.'))
+        return dict(type=m.group(2), pos=m.group(1), k=1 if m.group(2) in ('sap', 'smp') else 0, ratio=100,
+                    mag=mag)  # k = 0: random length / count in {2..5}
     m = _COND_RE.match(cond)
     if m is None:
         raise ValueError(f'unknown test condition {cond}')
@@ -139,6 +171,26 @@ def corrupt_window(xb, orig, typ, pos, k, ch, rng, raw_zero, guard=8):
         raise ValueError(typ)
 
 
+def tamer_window(xb, orig, typ, pos, alpha, rng, raw_zero):
+    """One TameR scenario on one window xb (L, C), in place (all channels, positions shared by the channels)."""
+    L, C = xb.shape
+    if typ in ('sap', 'smp'):
+        ts = np.array([L - 1]) if pos == 're' else rng.integers(0, L, size=1)
+    elif typ == 'cas':
+        n = int(min(rng.integers(2, 6), L))
+        s = L - n if pos == 're' else int(rng.integers(0, L - n + 1))
+        ts = np.arange(s, s + n)
+    elif typ == 'map':
+        ts = np.sort(rng.choice(L, size=int(min(rng.integers(2, 6), L)), replace=False))
+    else:
+        raise ValueError(typ)
+    if typ == 'smp':
+        xb[ts, :] = raw_zero
+        return
+    sig = orig.astype(np.float64).std(axis=0)  # (C,)
+    xb[ts, :] += (rng.standard_normal((len(ts), C)) * sig * alpha).astype(np.float32)
+
+
 def _grid_channels(rng, C, ratio):
     if ratio >= 100:
         return np.arange(C)
@@ -155,6 +207,13 @@ def apply_condition(x, cond, raw_zero, zero_mode='raw', rng=None, guard=8):
     xn = x.detach().float().cpu().numpy().copy()
     orig = xn.copy()
     B, L, C = xn.shape
+    if spec['type'] in TAMER_TYPES:  # TameR protocol (see module docstring)
+        rz_t = np.zeros(C, dtype=np.float32) if zero_mode == 'scaled' else np.asarray(raw_zero, dtype=np.float32)
+        for b in range(B):
+            tamer_window(xn[b], orig[b], spec['type'], spec['pos'], spec['mag'], rng, rz_t)
+        x_p = torch.from_numpy(xn).to(device=x.device, dtype=x.dtype)
+        changed = torch.from_numpy(np.abs(xn - orig) > 1e-6).to(x.device)
+        return x_p, changed
     rz = np.zeros(C, dtype=np.float32) if zero_mode == 'scaled' else np.asarray(raw_zero, dtype=np.float32)
     for b in range(B):
         ch = _grid_channels(rng, C, spec['ratio'])

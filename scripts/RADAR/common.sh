@@ -4,13 +4,16 @@
 #                             e3_period GTR_ARGS
 #
 # Environment knobs:
-#   MODE=full        S0 -> S1 (GTR+Aug) -> S2 -> S3 plug-in -> eval on the test grid (default)
+#   MODE=full        S0 -> [S1 GTR+Aug] -> [B3 denoise front] -> S2 -> S3 plug-in -> eval (default)
 #   MODE=revin       step 1: S0 (reused if base.pth exists) + RevIN 2×2 diagnostic on B0   (diag_v4.py revin)
 #   MODE=experts     step 2: offline expert repair errors (+ E1 if pre_<arch>.pth exists)   (diag_v4.py experts)
 #   MODE=det         step 3: S0 + S2 + detector AUROC per condition                         (diag_v4.py det)
 #   MODE=timing      inference time of the trained plug-in per module vs B0                (diag_v4.py timing)
 #                    DET_FEATS=v3 evaluates the v3-feature detector (separate checkpoint pre_<arch>_detv3.pth)
-#   MODE=eval        evaluation only (checkpoints must exist); METHODS="B0,B1,B2,Ours-plugin" by default.
+#   BASELINES="B0"   baselines to train / evaluate besides Ours-plugin (default B0 only). Add B1 (GTR+Aug, S1),
+#                    B2 (Hampel) and/or B3 (denoise front), e.g. BASELINES="B0,B1,B2,B3"; S1 / B3 are trained only
+#                    when listed
+#   MODE=eval        evaluation only (checkpoints must exist); METHODS="$BASELINES,Ours-plugin" by default.
 #                    e.g. ARCH=v5 METHODS=Ours-plugin MODE=eval adds the v5 plug-in as Ours-plugin-v5
 #   MODE=diag        v3 clean-headroom audit (diag_clean.py)
 #   QUICK=1          pred_len 96, seed 2024, plus the original run.py reproduction check (REPRO=1)
@@ -23,6 +26,9 @@
 #   ABLATION=1       also train/evaluate Ours (joint training, backbone fine-tuned) as an ablation
 #   ARGMAX=1         also evaluate the plug-in with hard (argmax) routing (Ours-argmax)
 #   ORACLE=1         also evaluate the plug-in with a perfect gate (Ours-oracle, upper bound of the gate)
+#   CONDITIONS="..." test conditions (default clean,tamer_re_sap,tamer_re_smp = TameR recent single anomalous point
+#                    (+N(0,(3σ)²) on the last point) and recent single missing point (last point = raw 0, = T1_raw);
+#                    "tamer" = clean + all 7 TameR scenarios; combine e.g. "tamer,T2_k4"; "grid" = the 53-condition grid)
 #   SKIP_EXISTING=1  reuse checkpoints that already exist (default 1; set 0 to retrain)
 #   PY=python  LOG_DIR=./logs_radar_v6  RESULTS_DIR=./results_radar_v6/  CKPT_DIR=./checkpoints_radar/
 #   ARCH=v5|v4       run an earlier architecture instead of v6 (its RADAR results are recorded as Ours-plugin-v5 ...)
@@ -40,6 +46,7 @@ REPRO_STRICT=${REPRO_STRICT:-1}
 ABLATION=${ABLATION:-0}
 ARGMAX=${ARGMAX:-0}
 ORACLE=${ORACLE:-0}
+BASELINES=${BASELINES:-B0}
 PY=${PY:-python}
 LOG_DIR=${LOG_DIR:-./logs_radar_v6}
 RESULTS_DIR=${RESULTS_DIR:-./results_radar_v6/}
@@ -47,6 +54,7 @@ CKPT_DIR=${CKPT_DIR:-./checkpoints_radar/}
 SKIP_EXISTING=${SKIP_EXISTING:-1}
 EXTRA_ARGS=${EXTRA_ARGS:-}
 RADAR_ARGS=${RADAR_ARGS:-}
+CONDITIONS=${CONDITIONS:-clean,tamer_re_sap,tamer_re_smp}
 if [ -n "${DET_FEATS:-}" ]; then RADAR_ARGS="$RADAR_ARGS --det_feats $DET_FEATS"; fi
 if [ -n "${ARCH:-}" ]; then RADAR_ARGS="$RADAR_ARGS --arch $ARCH"; fi
 E3_ARGS=()
@@ -70,7 +78,7 @@ _setup() {
              --pred_len "$pred_len" --random_seed "$seed")
   # shellcheck disable=SC2206
   common=("${data_args[@]}" "${GTR_ARGS[@]}" "${E3_ARGS[@]}" --backbone "$BACKBONE" --radar_ckpt_dir "$CKPT_DIR"
-          --results_dir "$RESULTS_DIR" --skip_existing "$skip" $EXTRA_ARGS $RADAR_ARGS)
+          --results_dir "$RESULTS_DIR" --skip_existing "$skip" --conditions "$CONDITIONS" $EXTRA_ARGS $RADAR_ARGS)
   log=$LOG_DIR/$setting
 }
 
@@ -89,10 +97,15 @@ run_one() {
       if [ "$REPRO_STRICT" = "1" ]; then echo "reproduction check failed -> stopping (REPRO_STRICT=0 to continue)"; exit 2; fi
     fi
   fi
-  $PY -u run_radar.py train_aug      "${common[@]}" 2>&1 | tee "${log}__S1.log"
+  if [[ ",$BASELINES," == *",B1,"* ]]; then
+    $PY -u run_radar.py train_aug    "${common[@]}" 2>&1 | tee "${log}__S1.log"
+  fi
+  if [[ ",$BASELINES," == *",B3,"* ]]; then
+    $PY -u run_radar.py train_denoise "${common[@]}" 2>&1 | tee "${log}__B3.log"
+  fi
   $PY -u run_radar.py pretrain_radar "${common[@]}" 2>&1 | tee "${log}__S2.log"
   $PY -u run_radar.py train_radar    "${common[@]}" --freeze_backbone 2>&1 | tee "${log}__S3plugin.log"
-  local methods="B0,B1,B2,Ours-plugin"
+  local methods="$BASELINES,Ours-plugin"
   if [ "$ARGMAX" = "1" ]; then methods="$methods,Ours-argmax"; fi
   if [ "$ORACLE" = "1" ]; then methods="$methods,Ours-oracle"; fi
   if [ "$ABLATION" = "1" ]; then  # joint training (backbone also fine-tuned) = ablation only
@@ -115,7 +128,7 @@ run_step_one() {  # MODE = revin | experts | det | timing
 run_eval_one() {
   _setup "$1" "$2" 1
   echo "================ [eval] $setting ================"
-  $PY -u run_radar.py eval "${common[@]}" --methods "${METHODS:-B0,B1,B2,Ours-plugin}" 2>&1 | tee "${log}__eval${ARCH:+_$ARCH}.log"
+  $PY -u run_radar.py eval "${common[@]}" --methods "${METHODS:-$BASELINES,Ours-plugin}" 2>&1 | tee "${log}__eval${ARCH:+_$ARCH}.log"
 }
 
 run_diag_one() {

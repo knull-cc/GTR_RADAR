@@ -7,7 +7,7 @@ Outputs (in results_dir):
                          Δ of Ours-plugin vs each baseline, RADAR diagnostics (AUROC, gate, repair error, π)
   summary_appendix.md    breakdown by length k and by channel ratio
   summary_router.md      Router coefficients (log-odds vs E1) and π at open gates by gap length
-Main methods: B0 GTR, B1 GTR+Aug, B2 GTR+Hampel, Ours-plugin; Ours (joint) / Ours-uncal / Ours-argmax / Ours-oracle
+Main methods: B0 GTR, B1 GTR+Aug, B2 GTR+Hampel, B3 GTR+DenoiseFront (same mixture, backbone frozen), Ours-plugin; Ours (joint) / Ours-uncal / Ours-argmax / Ours-oracle
 (perfect gate, diagnostic), earlier architectures (Ours-plugin-v5, ...) and switch variants (Ours-plugin_th,
 Ours-plugin_expe1e2e3, ...) are listed separately.
 """
@@ -19,22 +19,26 @@ from collections import defaultdict
 
 import numpy as np
 
-from radar.perturb import OOD_TYPES, POS_LABEL, POSITIONS, TYPE_LABEL, TYPES, parse_condition
+from radar.perturb import (OOD_TYPES, POS_LABEL, POSITIONS, TAMER_POSITIONS, TAMER_TYPES, TYPE_LABEL, TYPES,
+                           parse_condition)
 
-MAIN_METHODS = ('B0', 'B1', 'B2', 'Ours-plugin')
+MAIN_METHODS = ('B0', 'B1', 'B2', 'B3', 'Ours-plugin')
 EXTRA_METHODS = ('Ours-recal', 'Ours-uncal', 'Ours-argmax', 'Ours-oracle', 'Ours')
 ALL_METHODS = MAIN_METHODS + EXTRA_METHODS
-BASELINES = ('B0', 'B1', 'B2')
+BASELINES = ('B0', 'B1', 'B2', 'B3')
 OURS = 'Ours-plugin'
 RADAR_METHODS = ('Ours-plugin', 'Ours-recal', 'Ours-uncal', 'Ours-argmax', 'Ours-oracle', 'Ours')
-METHOD_LABEL = {'B0': 'B0 GTR', 'B1': 'B1 GTR+Aug', 'B2': 'B2 GTR+Hampel', 'Ours-plugin': 'Ours-plugin',
+METHOD_LABEL = {'B0': 'B0 GTR', 'B1': 'B1 GTR+Aug', 'B2': 'B2 GTR+Hampel', 'B3': 'B3 GTR+DenoiseFront',
+                'Ours-plugin': 'Ours-plugin',
                 'Ours-argmax': 'Ours-plugin (argmax π)', 'Ours-oracle': 'Ours-plugin (oracle gate)',
                 'Ours-uncal': 'Ours-plugin (τ as trained, no recalibration)',
                 'Ours-recal': 'Ours-plugin (τ recalibrated to the clean budget)',
                 'Ours': 'Ours (joint)'}
-DATASET_ORDER = ['etth1', 'etth2', 'ettm1', 'ettm2', 'weather', 'electricity', 'traffic', 'solar']
+DATASET_ORDER = ['etth1', 'etth2', 'ettm1', 'ettm2', 'weather', 'exchange', 'electricity', 'traffic', 'solar']
 MAIN_GROUPS = [(t, p) for t in TYPES for p in POSITIONS]
 OOD_GROUPS = [(t, p) for t in OOD_TYPES for p in POSITIONS]
+# TameR protocol (ICML 2026): RE-SAP, RE-CAS, RE-SMP, RA-SAP, RA-CAS, RA-SMP, RA-MAP
+TAMER_GROUPS = [(t, p) for p in TAMER_POSITIONS for t in TAMER_TYPES if (t, p) != ('map', 're')]
 
 
 def _ds_key(name):
@@ -58,6 +62,8 @@ def _pct_impr(b, o):
 
 
 def _gl(g):
+    if g[0] in TAMER_TYPES:
+        return f'{g[1].upper()}-{TYPE_LABEL[g[0]]}'
     return f'{TYPE_LABEL[g[0]].replace(" (OOD)", "")}-{POS_LABEL[g[1]][0]}'
 
 
@@ -141,10 +147,11 @@ def summarize(results_dir='./results_radar_v6/', print_tables=True, **_):
         v = cm.get((ds, H, m, 'clean'))
         return v[idx] if v else float('nan')
 
-    groups_present = [g for g in MAIN_GROUPS + OOD_GROUPS
+    groups_present = [g for g in MAIN_GROUPS + OOD_GROUPS + TAMER_GROUPS
                       if any(spec.get(c) and (spec[c]['type'], spec[c]['pos']) == g for c in spec)]
     main_groups = [g for g in MAIN_GROUPS if g in groups_present]
-    ood_groups = [g for g in OOD_GROUPS if g in groups_present]
+    tamer_groups = [g for g in TAMER_GROUPS if g in groups_present]
+    ood_groups = [g for g in OOD_GROUPS if g in groups_present] + tamer_groups  # all types unseen in training
 
     # ---------------- CSVs
     os.makedirs(results_dir, exist_ok=True)
@@ -191,15 +198,56 @@ def summarize(results_dir='./results_radar_v6/', print_tables=True, **_):
                     rows.append(row)
         return rows
 
+    # ---------------- per-condition tables (small condition sets, e.g. clean / T1_raw / T2_k4)
+    all_conds = sorted({k[3] for k in cm}, key=lambda c: (c != 'clean', c))
+    if len(all_conds) <= 12:
+        def cond_val(ds, H, m, c, idx):
+            v = cm.get((ds, H, m, c))
+            return v[idx] if v else float('nan')
+
+        for idx, metric in ((0, 'MSE'), (1, 'MAE')):
+            md.append(f'### {metric} per test condition (avg = mean over H)')
+            rows = []
+            for ds in sorted({d for d, _ in dsh}, key=_ds_key):
+                Hs = [H for d, H in dsh if d == ds]
+                for H in Hs + ([rows_avg_key] if len(Hs) > 1 else []):
+                    for m in main:
+                        if H != rows_avg_key and not conds_of(ds, H, m):
+                            continue
+                        if H == rows_avg_key:
+                            vals = [_mean([cond_val(ds, h, m, c, idx) for h in Hs]) for c in all_conds]
+                        else:
+                            vals = [cond_val(ds, H, m, c, idx) for c in all_conds]
+                        rows.append([ds, str(H), _label(m)] + [_f(v) for v in vals])
+            _table(md, ['Dataset', 'H', 'Method'] + all_conds, rows)
+        if OURS in methods:
+            md.append('### Δ MSE per test condition, (B − Ours-plugin) / B, + = Ours-plugin better')
+            rows = []
+            for ds, H in dsh:
+                for b in [b for b in BASELINES if b in methods]:
+                    if conds_of(ds, H, b) and conds_of(ds, H, OURS):
+                        rows.append([ds, str(H), f'vs {b}'] + [_pct_impr(cond_val(ds, H, b, c, 0),
+                                                                        cond_val(ds, H, OURS, c, 0))
+                                                             for c in all_conds])
+            _table(md, ['Dataset', 'H', 'Baseline'] + all_conds, rows)
+
     for idx, metric in ((0, 'MSE'), (1, 'MAE')):
-        md.append(f'### {metric} — Clean + 4 types × 2 positions (each cell = mean over lengths and channel '
-                  f'ratios; T = tail, I = internal; avg = mean over H)')
-        _table(md, ['Dataset', 'H', 'Method', 'Clean'] + [_gl(g) for g in main_groups],
-               table_rows(main, main_groups, idx))
-        if ood_groups:
+        if tamer_groups:
+            md.append(f'### {metric} — TameR protocol (ICML 2026): RE = recent, RA = random; SAP / CAS / MAP = single '
+                      f'point / segment of 2–5 / 2–5 isolated points + N(0, (3σ)²), SMP = one point set to the raw 0; '
+                      f'avg = mean over H')
+            _table(md, ['Dataset', 'H', 'Method', 'Clean'] + [_gl(g) for g in tamer_groups],
+                   table_rows(main, tamer_groups, idx))
+        if main_groups:
+            md.append(f'### {metric} — Clean + 4 types × 2 positions (each cell = mean over lengths and channel '
+                      f'ratios; T = tail, I = internal; avg = mean over H)')
+            _table(md, ['Dataset', 'H', 'Method', 'Clean'] + [_gl(g) for g in main_groups],
+                   table_rows(main, main_groups, idx))
+        if ood_groups and ood_groups != tamer_groups:
+            og = [g for g in ood_groups if g not in tamer_groups]
             md.append(f'### {metric} — OOD (type never used in training)')
-            _table(md, ['Dataset', 'H', 'Method'] + [_gl(g) for g in ood_groups],
-                   table_rows(main, ood_groups, idx, with_clean=False))
+            _table(md, ['Dataset', 'H', 'Method'] + [_gl(g) for g in og],
+                   table_rows(main, og, idx, with_clean=False))
         extra = [m for m in methods if m not in MAIN_METHODS]
         if extra:
             md.append(f'### {metric} — additional RADAR variants')

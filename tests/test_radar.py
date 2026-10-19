@@ -174,6 +174,42 @@ def test_legacy_conditions_and_y_untouched():
     assert torch.equal(xf[:, -8:], x[:, -9:-8].expand(B, 8, C))
 
 
+def test_tamer_conditions():
+    """TameR (ICML 2026) scenarios: positions shared by the channels, δ ~ N(0, (3σ)²) per point and channel."""
+    from radar.perturb import TAMER_CONDITIONS
+    rz = np.full(C, -4.0, dtype=np.float32)
+    x = torch.randn(64, L, C, generator=torch.Generator().manual_seed(5)) * 2.0 + 1.0
+    assert parse_condition('tamer_last_r3') == dict(type='sap', pos='re', k=1, ratio=100, mag=3.0)
+    assert parse_condition('tamer_ra_cas_r0p5')['mag'] == 0.5 and parse_condition('tamer_ra_map')['mag'] == 3.0
+    with pytest.raises(ValueError):
+        parse_condition('tamer_re_map')
+    for cond in TAMER_CONDITIONS:
+        sp = parse_condition(cond)
+        xp, ch = apply_condition(x, cond, rz, 'raw', condition_rng(7, cond, 0))
+        xp2, _ = apply_condition(x, cond, rz, 'raw', condition_rng(7, cond, 0))
+        assert torch.equal(xp, xp2), cond
+        assert torch.equal(ch, (xp - x).abs() > 1e-6), cond
+        t_any = ch.any(dim=2)  # (B, L)
+        n = t_any.sum(dim=1)
+        assert torch.equal(ch.any(dim=2, keepdim=True).expand_as(ch), ch), cond  # every channel, same steps
+        if sp['type'] in ('sap', 'smp'):
+            assert (n == 1).all(), cond
+        else:
+            assert ((n >= 2) & (n <= 5)).all(), cond
+        if sp['pos'] == 're':
+            assert t_any[:, -1].all(), cond
+            if sp['type'] == 'cas':
+                assert all(bool(t_any[b, L - int(n[b]):].all()) for b in range(len(n))), cond
+        else:
+            assert len(set(t_any.float().argmax(dim=1).tolist())) > 1, cond
+        if sp['type'] == 'smp':
+            assert torch.allclose(xp[ch], torch.full_like(xp[ch], -4.0)), cond
+        else:
+            sig = x.std(dim=1, unbiased=False, keepdim=True).expand_as(x)
+            z = ((xp - x)[ch] / sig[ch]) / sp['mag']
+            assert abs(float(z.mean())) < 0.25 and abs(float(z.std()) - 1.0) < 0.2, cond  # N(0, 1)
+
+
 def test_test_grid_definitions():
     conds = grid_conditions('full')
     assert conds[0] == 'clean' and len(conds) == 53 and len(grid_conditions('main')) == 27
@@ -911,3 +947,25 @@ def test_label_free_masked_forecast_training_and_clean_budget():
     assert se1 <= 1.01 * se0 + 1e-6  # the chosen gate respects the clean budget on these windows
     a = types.SimpleNamespace(arch='v6', experts='auto', label_free=1, lf_train=1, lf_clean_budget=0.01, ckpt_tag='')
     assert ckpt_suffix(a, 'pre') == '_lf' and ckpt_suffix(a, 'plugin') == '_lf_mf'
+
+
+# B3: same-information denoising front-end ----------------------------------------------------------------------
+def test_denoise_front_identity_at_init_and_gradients():
+    from radar.baselines import DenoiseFront
+    cfg = make_cfg()
+    bb = make_gtr(cfg)
+    Fm = DenoiseFront(bb, cfg).eval()
+    x, ci = make_batch()
+    with torch.no_grad():
+        assert torch.allclose(Fm(x, ci), bb(x, ci), atol=1e-5)  # zero-initialised head: x̂ = x
+    for p in bb.parameters():
+        p.requires_grad_(False)
+    Fm.train()
+    x_hat, s = Fm.clean(x)
+    loss = (bb(x_hat, ci) ** 2).mean() + (((x_hat - x) / s) ** 2).mean()
+    loss.backward()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in Fm.front_parameters())
+    assert all(p.grad is None for p in bb.parameters())
+    n_front = sum(p.numel() for p in Fm.front_parameters())
+    W, _, _ = make_wrapper(arch='v6')
+    assert n_front <= sum(p.numel() for p in W.repairer.parameters()) * 1.5  # same scale as RADAR's Repairer

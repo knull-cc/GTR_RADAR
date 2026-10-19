@@ -27,10 +27,15 @@ from radar.losses import (det_loss, hindsight_loss, hindsight_targets, patch_mas
                           rec_loss, route_loss)
 from radar.modules import LENGTH_BINS, hampel_filter, length_bin, robust_stats
 from radar.perturb import TEST_CONDITIONS, MixturePerturber, apply_condition, condition_rng, raw_zero_from_scaler
+from radar.baselines import DenoiseFront
 from radar.radar import RADARWrapper, resolve_experts, resolve_tau_recal
 from utils.tools import adjust_learning_rate
 
-METHODS = ('B0', 'B1', 'B2', 'Ours-plugin')  # main protocol; 'Ours' (joint) and 'Ours-argmax' (hard routing) optional
+METHODS = ('B0', 'Ours-plugin')  # main protocol; 'Ours' (joint) and 'Ours-argmax' (hard routing) optional
+
+
+def _first_out(out):
+    return out[0] if isinstance(out, (tuple, list)) else out
 
 
 class EarlyStopper:
@@ -123,7 +128,7 @@ def ckpt_paths(args):
     # files. base (pure GTR) is shared; the GTR+Aug control (aug_v4) depends only on the v4 perturbation mixture and
     # is shared by v4, v5 and v6.
     arch = getattr(args, 'arch', 'v6')
-    names = dict(base='base', aug='aug_v4', pre=f'pre_{arch}' + ckpt_suffix(args, 'pre'),
+    names = dict(base='base', aug='aug_v4', denoise='denoise_v4', pre=f'pre_{arch}' + ckpt_suffix(args, 'pre'),
                  radar=f'radar_{arch}' + ckpt_suffix(args, 'radar'),
                  plugin=f'plugin_{arch}' + ckpt_suffix(args, 'plugin'))
     return {k: os.path.join(d, f'{v}.pth') for k, v in names.items()}
@@ -365,6 +370,52 @@ class Exp_Radar(Exp_Main):
                 break
             self._type3(opt, epoch + 1)
         self.model.load_state_dict(torch.load(out_ckpt, map_location=self.device))
+
+    # ------------------------------------------------------------------ B3
+    def train_denoise(self, base_ckpt, out_ckpt):
+        """B3 (same-information control): a denoising front-end trained on the RADAR corruption mixture in front of
+        the frozen backbone; loss = forecast MSE + λ_rec · mean((x̂ − x_clean)/s)² over all points (clean target)."""
+        args = self.args
+        assert not self.use_radar
+        Fm = DenoiseFront(self.build_backbone(), args).float().to(self.device)
+        Fm.backbone.load_state_dict(torch.load(base_ckpt, map_location=self.device))
+        for p in Fm.backbone.parameters():
+            p.requires_grad_(False)
+        _, train_loader = self.get_data('train')
+        rz = self.raw_zero()
+        perturber = self.mixture(rz, args.random_seed + 101)  # same stream as S1 / S3
+        val_pert = self.mixture(rz, args.val_seed)
+        opt = optim.Adam(Fm.front_parameters(), lr=args.radar_lr)
+        lam_rec = float(getattr(args, 'lam_rec', 0.5))
+        stopper = EarlyStopper(args.ft_patience, out_ckpt)
+        torch.manual_seed(args.random_seed + 7)
+        s, cl, pe = self.val_score(Fm, val_pert)
+        print(f'[B3] start: val_score {s:.6f} (clean {cl:.6f}, perturbed {pe:.6f})')
+        for epoch in range(args.ft_epochs):
+            Fm.train()
+            Fm.backbone.eval()
+            t0, logs = time.time(), []
+            for bx, by, _, _, bc in train_loader:
+                x_clean = bx.float()
+                x_p, _, _ = perturber(x_clean)
+                x_p, y, c = self._to_dev(x_p, by, bc)
+                x_clean = x_clean.to(self.device)
+                opt.zero_grad()
+                x_hat, sc = Fm.clean(x_p)
+                out = _first_out(Fm.backbone(x_hat, c))[:, -args.pred_len:, self.f_dim:]
+                mse = F.mse_loss(out, y[:, -args.pred_len:, self.f_dim:])
+                rec = (((x_hat - x_clean) / sc) ** 2).mean()
+                (mse + lam_rec * rec).backward()
+                opt.step()
+                logs.append((mse.item(), rec.item()))
+            s, cl, pe = self.val_score(Fm, val_pert)
+            m_, r_ = np.mean(logs, axis=0)
+            print(f'[B3] epoch {epoch + 1} ({time.time() - t0:.1f}s) mse {m_:.5f} rec {r_:.4f} | '
+                  f'val_score {s:.6f} (clean {cl:.6f}, perturbed {pe:.6f})')
+            stopper(s, Fm)
+            if stopper.early_stop:
+                print('Early stopping')
+                break
 
     # ------------------------------------------------------------------ S2
     def _det_rec_val(self, val_pert):
@@ -902,7 +953,7 @@ class Exp_Radar(Exp_Main):
         a = self.args
         return lambda x: hampel_filter(x, a.hampel_window, a.hampel_k, a.hampel_mad_scale)
 
-    METHOD_CKPT = {'B0': 'base', 'B1': 'aug', 'B2': 'base', 'Ours': 'radar', 'Ours-plugin': 'plugin',
+    METHOD_CKPT = {'B0': 'base', 'B1': 'aug', 'B2': 'base', 'B3': 'denoise', 'Ours': 'radar', 'Ours-plugin': 'plugin',
                    'Ours-argmax': 'plugin', 'Ours-oracle': 'plugin', 'Ours-uncal': 'plugin', 'Ours-recal': 'plugin'}
 
     def load_method(self, method, paths):
@@ -916,6 +967,8 @@ class Exp_Radar(Exp_Main):
             return None, None
         if method in ('B0', 'B1', 'B2'):
             m = self.build_backbone().to(self.device)
+        elif method == 'B3':
+            m = DenoiseFront(self.build_backbone(), self.args).float().to(self.device)
         else:
             m = self.build_wrapper().to(self.device)
             m.force_gate_zero = bool(self.args.force_gate_zero)
@@ -949,7 +1002,7 @@ class Exp_Radar(Exp_Main):
             # RADAR methods of a non-default architecture are recorded as e.g. 'Ours-plugin-v4', so they can sit next
             # to the default architecture in the same results directory
             name = method
-            if method not in ('B0', 'B1', 'B2'):
+            if method not in ('B0', 'B1', 'B2', 'B3'):
                 if args.arch != 'v6':
                     name = f'{name}-{args.arch}'
                 sfx = ckpt_suffix(args, 'radar' if method == 'Ours' else 'plugin')

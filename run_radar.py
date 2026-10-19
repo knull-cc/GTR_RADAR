@@ -5,9 +5,10 @@
 commands:
   train_base      S0  plain backbone, original training recipe (no per-epoch test pass)      -> base.pth
   train_aug       S1  fine-tune backbone with the RADAR v4 augmentation mixture (control)    -> aug_v4.pth
+  train_denoise   B3  denoising front-end on the same mixture, backbone frozen (control)       -> denoise_v4.pth
   pretrain_radar  S2  frozen backbone, RADAR only (L_det + L_rec)                            -> pre_<arch>.pth
   train_radar     S3  joint training, full loss (add --freeze_backbone for the plug-in)      -> radar_ / plugin_<arch>.pth
-  eval                B0, B1 (GTR+Aug), B2 (Hampel), Ours-plugin [+ Ours, Ours-argmax, Ours-oracle] x the test grid
+  eval                B0, B1 (GTR+Aug), B2 (Hampel), B3 (denoise front), Ours-plugin [+ Ours, Ours-argmax, Ours-oracle]
   summarize           <results_dir>/raw/*.json -> summary.csv / summary_extras.csv / summary.md
   plot                figures (dependency profiles, example windows)
   repro_check         compare S0 test MSE with the original run.py (see run_orig.py)
@@ -23,7 +24,7 @@ import torch
 
 import radar.compat  # noqa: F401  (must precede utils.tools usage on numpy>=2)
 
-COMMANDS = ['train_base', 'train_aug', 'pretrain_radar', 'train_radar', 'eval', 'summarize', 'plot', 'repro_check']
+COMMANDS = ['train_base', 'train_aug', 'train_denoise', 'pretrain_radar', 'train_radar', 'eval', 'summarize', 'plot', 'repro_check']
 
 
 def build_parser():
@@ -214,13 +215,15 @@ def build_parser():
     g.add_argument('--quick', action='store_true', default=False, help='1 seed (2024), pred_len 96')
     g.add_argument('--ckpt_tag', type=str, default='', help='extra tag appended to the RADAR checkpoint names')
     g.add_argument('--skip_existing', type=int, default=0, help='skip a training stage if its checkpoint exists')
-    g.add_argument('--methods', type=str, default='B0,B1,B2,Ours-plugin',
+    g.add_argument('--methods', type=str, default='B0,Ours-plugin',
                    help='add Ours (joint-training ablation), Ours-argmax (plug-in with hard routing), '
                         'Ours-oracle (plug-in with a perfect gate: diagnostic upper bound) or Ours-recal (plug-in '
                         'with τ recalibrated after training to the clean false-repair budget)')
-    g.add_argument('--conditions', type=str, default='grid',
-                   help="'grid' = the v4 test grid (--test_grid), or a comma list of condition names "
-                        "(e.g. zero_tail_k4_c100; legacy T1_raw, T2_k4, T3_flat ...)")
+    g.add_argument('--conditions', type=str, default='tamer',
+                   help="test conditions: comma list; 'tamer' = clean + the 7 TameR (ICML 2026) scenarios "
+                        "tamer_{re,ra}_{sap,cas,smp} + tamer_ra_map (α = 3; suffix _r1 etc. for other α); legacy "
+                        "T1_raw (= tamer_re_smp), T2_k4; 'grid' = the 53-condition test grid (--test_grid); names like "
+                        "zero_tail_k4_c100. Items can be combined, e.g. tamer,T2_k4")
     g.add_argument('--test_grid', type=str, default='full', choices=['full', 'main'],
                    help='full: 100%% and 50%% of the channels; main: 100%% only (half the evaluation time)')
     g.add_argument('--no_ood', action='store_true', default=False, help='drop the OOD type (shift) from the grid')
@@ -247,12 +250,16 @@ def _conditions(args):
     if args.conditions.strip() in ('grid', 'full', 'main'):
         grid = args.test_grid if args.conditions.strip() == 'grid' else args.conditions.strip()
         return grid_conditions(grid, ood=not args.no_ood)
-    conds = [c.strip() for c in args.conditions.split(',') if c.strip()]
+    from radar.perturb import TAMER_CONDITIONS
+    conds = []
+    for c in (c.strip() for c in args.conditions.split(',')):
+        if c:
+            conds += list(TAMER_CONDITIONS) if c == 'tamer' else [c]
     bad = [c for c in conds if not is_valid_condition(c)]
     if bad:
         raise SystemExit(f'unknown condition(s) {bad}; use type_pos_k<k>_c<ratio> (e.g. zero_tail_k4_c100) or a '
-                         f'legacy name (T1_raw, T1_scaled, T2_k<k>, T3_flat)')
-    conds = [c for c in conds if c != 'clean']
+                         f'legacy name (T1_raw, T1_scaled, T2_k<k>, T3_flat), tamer or tamer_<re|ra>_<sap|cas|smp|map>[_r<α>]')
+    conds = list(dict.fromkeys(c for c in conds if c != 'clean'))
     return ['clean'] + conds
 
 
@@ -330,6 +337,12 @@ def main():
             print(f'skip: {paths["aug"]} exists')
             return
         Exp_Radar(args, use_radar=False).train_aug(paths['base'], paths['aug'])
+
+    elif cmd == 'train_denoise':
+        if args.skip_existing and os.path.exists(paths['denoise']):
+            print(f'skip: {paths["denoise"]} exists')
+            return
+        Exp_Radar(args, use_radar=False).train_denoise(paths['base'], paths['denoise'])
 
     elif cmd == 'pretrain_radar':
         if args.skip_existing and os.path.exists(paths['pre']):
