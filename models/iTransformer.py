@@ -40,7 +40,7 @@ class Model(nn.Module):
             means = x_enc.mean(1, keepdim=True).detach()
             x_enc = x_enc - means
             stdev = torch.sqrt(torch.var(x_enc, dim=1, keepdim=True, unbiased=False) + 1e-5)
-            x_enc /= stdev
+            x_enc = x_enc / stdev  # out of place (same values): RADAR back-propagates through the input
 
         _, _, N = x_enc.shape  # B L N
         # B: batch_size;    E: d_model;

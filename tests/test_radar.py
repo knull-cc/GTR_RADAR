@@ -895,14 +895,17 @@ def test_plain_itransformer_backbone(use_marks):
     W.tau_raw.data.fill_(-1e4)  # open gate: every window changed -> second pass with concatenated marks
     xp = x.clone()
     xp[:, -1, :] = -4.0
-    with torch.no_grad():
-        y = W(xp, xm)
+    y = W(xp, xm)  # with autograd, as in S3 (iTransformer's normalisation must not be in place)
     assert y.shape == (B, H, C) and torch.isfinite(y).all()
     aux = W.last_aux
     mask = torch.zeros_like(xp, dtype=torch.bool)
     mask[:, -1, :] = True
     lr = route_loss(W, aux, xp, mask, torch.randn(B, H, C), (xm,), H)
     assert lr is not None and torch.isfinite(lr)
+    rp = [p for p in W.router.parameters() if p.requires_grad]
+    g = torch.autograd.grad(lr, rp, allow_unused=True)
+    assert any(t is not None for t in g)
+    (y ** 2).mean().backward()  # forecast-loss path through the mixed forecast
     tg = hindsight_targets(bb, xp, xm, torch.randn(B, H, C), aux['target'], W.P, H)
     assert tg['h'].shape[:2] == (B, 2)
 
