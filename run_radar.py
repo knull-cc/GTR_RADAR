@@ -100,7 +100,12 @@ def build_parser():
 
     # ===================== RADAR
     g = parser.add_argument_group('RADAR')
-    g.add_argument('--backbone', type=str, default='GTR', choices=['GTR', 'GTRiTransformer', 'GTRPatchTST', 'GTRDLinear'])
+    g.add_argument('--backbone', type=str, default='GTR',
+                   choices=['GTR', 'GTRiTransformer', 'GTRPatchTST', 'GTRDLinear', 'iTransformer'],
+                   help='iTransformer = the plain iTransformer (thuml), fed x_mark_enc like the official code '
+                        '(None on Solar / PEMS); see scripts/RADAR_iTransformer/')
+    g.add_argument('--radar_batch_size', type=int, default=0,
+                   help='batch size of S2 / S3 training and their validation (0 = --batch_size); S0 keeps --batch_size')
     g.add_argument('--radar_patch', type=int, default=8, help='RADAR patch length P')
     g.add_argument('--radar_d', type=int, default=64)
     g.add_argument('--radar_heads', type=int, default=4)
@@ -209,6 +214,10 @@ def build_parser():
     g.add_argument('--ft_epochs', type=int, default=10, help='S1/S3 max epochs')
     g.add_argument('--ft_patience', type=int, default=3, help='S1/S3 patience')
     g.add_argument('--pre_epochs', type=int, default=20, help='S2 (stage A) epochs; best epoch kept by val')
+    g.add_argument('--pre_patience', type=int, default=0,
+                   help='S2: stop after this many epochs without a val improvement (0 = run all pre_epochs, default; '
+                        'the best epoch is kept either way). Changes S2 only; the checkpoint name is unchanged, so use '
+                        'it for complete runs (or remove pre_v6.pth to retrain)')
     g.add_argument('--val_seed', type=int, default=20240917, help='fixed seed of the validation perturbations')
     g.add_argument('--mimic_test_rng', type=int, default=1,
                    help='S0: consume the global-RNG draw of the removed per-epoch test pass (exact run.py stream)')

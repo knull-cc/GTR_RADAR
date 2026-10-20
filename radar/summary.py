@@ -95,8 +95,14 @@ def _fv(v, nd=2):
     return '/'.join(_f(x, nd) for x in np.ravel(v)) if np.ndim(v) > 0 else _f(v, nd)
 
 
+_BACKBONE = ['GTR']  # backbone of the summarised records (labels of B0 / B1 / B2 / B3)
+
+
 def _label(m):
-    return METHOD_LABEL.get(m, m)
+    lab = METHOD_LABEL.get(m, m)
+    if _BACKBONE[0] != 'GTR' and m in ('B0', 'B1', 'B2', 'B3'):
+        lab = lab.replace('GTR', _BACKBONE[0])
+    return lab
 
 
 def summarize(results_dir='./results_radar_v6/', print_tables=True, **_):
@@ -105,6 +111,10 @@ def summarize(results_dir='./results_radar_v6/', print_tables=True, **_):
     if not evals:
         print(f'no eval results in {raw_dir}')
         return
+    bbs = sorted({str(r.get('backbone', 'GTR')) for r in evals})
+    _BACKBONE[0] = bbs[0] if len(bbs) == 1 else '/'.join(bbs)
+    if len(bbs) > 1:
+        print(f'WARNING: {raw_dir} mixes backbones {bbs}; rows of the same dataset / H / method are averaged together')
 
     # ---------------- per condition: (ds, H, method, cond) -> {seed: (mse, mae)}
     cond_tab = defaultdict(dict)

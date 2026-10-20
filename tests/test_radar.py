@@ -873,6 +873,55 @@ def test_repair_range_clamp_and_s3_revision(tmp_path):
     assert ckpt_suffix(a, 'plugin') == '_rc0' and ckpt_paths(a)['plugin'].endswith('plugin_v6_s2_rc0.pth')
 
 
+@pytest.mark.parametrize('use_marks', [True, False])
+def test_plain_itransformer_backbone(use_marks):
+    """RADAR around the plain iTransformer: the extra backbone argument is x_mark_enc (or None, as the official code on
+    Solar); closed gate = the backbone; forecast mixing, the second pass on changed windows, the dependency probes,
+    the route loss and the hindsight targets all pass the marks along; dataset items carry the marks in slot 5."""
+    from exp.exp_radar import _marks_as_condition
+    from models import iTransformer as ITR
+    kw = dict(arch='v6', d_model=32, d_ff=32, n_heads=4, e_layers=1, factor=1, activation='gelu', dropout=0.1,
+              embed='timeF', freq='h', output_attention=False, dep_mode='grad')
+    cfg = make_cfg(force_gate_zero=True, **kw)
+    torch.manual_seed(0)
+    bb = ITR.Model(cfg).float().eval()
+    W = RADARWrapper(bb, cfg).eval()
+    x, _ = make_batch()
+    xm = torch.randn(B, L, 4, generator=torch.Generator().manual_seed(9)) if use_marks else None
+    with torch.no_grad():
+        ref = bb(x, xm)
+        assert torch.allclose(W(x, xm), ref, atol=1e-6, rtol=0)
+    W.force_gate_zero = False
+    W.tau_raw.data.fill_(-1e4)  # open gate: every window changed -> second pass with concatenated marks
+    xp = x.clone()
+    xp[:, -1, :] = -4.0
+    with torch.no_grad():
+        y = W(xp, xm)
+    assert y.shape == (B, H, C) and torch.isfinite(y).all()
+    aux = W.last_aux
+    mask = torch.zeros_like(xp, dtype=torch.bool)
+    mask[:, -1, :] = True
+    lr = route_loss(W, aux, xp, mask, torch.randn(B, H, C), (xm,), H)
+    assert lr is not None and torch.isfinite(lr)
+    tg = hindsight_targets(bb, xp, xm, torch.randn(B, H, C), aux['target'], W.P, H)
+    assert tg['h'].shape[:2] == (B, 2)
+
+    class _DS(torch.utils.data.Dataset):
+        def __len__(self):
+            return 3
+
+        def __getitem__(self, i):
+            return np.full((L, C), i), np.zeros((H, C)), np.full((L, 4), 10 + i), np.zeros((H, 4)), i
+
+    ds = _DS()
+    _marks_as_condition(ds)
+    _marks_as_condition(ds)  # idempotent
+    item = ds[2]
+    assert np.array_equal(item[4], np.full((L, 4), 12)) and isinstance(ds, _DS)
+    bx, by, bxm, bym, bc = next(iter(torch.utils.data.DataLoader(ds, batch_size=3)))
+    assert bc.shape == (3, L, 4)
+
+
 def test_nanmedian_small_equals_torch_nanmedian():
     g = torch.Generator().manual_seed(3)
     for shape, dim in (((40, 9, 3), -1), ((40, 9, 3, 6), 2), ((40, 3), 1), ((20, 5), -1)):

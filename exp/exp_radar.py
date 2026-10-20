@@ -161,6 +161,29 @@ def _sync(device):
         torch.cuda.synchronize(device)
 
 
+GTR_FAMILY = ('GTR', 'GTRiTransformer', 'GTRPatchTST', 'GTRDLinear', 'CycleNet')
+PLAIN_BACKBONES = ('iTransformer',)
+_MARK_CLASSES = {}
+
+
+def _marks_as_condition(ds):
+    """Plain backbones that take time features (iTransformer: x_mark_enc as extra variate tokens): the dataset's
+    5th item (GTR's cycle index) is replaced by seq_x_mark, so every RADAR loop passes the marks as the backbone's
+    extra argument (bb_args) without any other change. The loaders keep the same dataset object (sampler, shuffling
+    and drop_last unchanged); only the item's last field differs."""
+    base = type(ds)
+    if getattr(base, '_marks_as_condition', False):
+        return
+    cls = _MARK_CLASSES.get(base)
+    if cls is None:
+        def __getitem__(self, i):
+            item = base.__getitem__(self, i)
+            return item[0], item[1], item[2], item[3], item[2]
+        cls = type(base.__name__ + 'WithMarks', (base,), {'__getitem__': __getitem__, '_marks_as_condition': True})
+        _MARK_CLASSES[base] = cls
+    ds.__class__ = cls
+
+
 class Exp_Radar(Exp_Main):
     def __init__(self, args, use_radar=False):
         self.use_radar = bool(use_radar)
@@ -192,17 +215,57 @@ class Exp_Radar(Exp_Main):
     def backbone(self):
         return self.model.backbone if self.use_radar else self.model
 
+    @property
+    def cond_mode(self):
+        """What the backbone takes besides x: 'cycle' (GTR family / CycleNet: the cycle index), 'marks' (iTransformer:
+        the time features x_mark_enc, as in the official code) or 'none' (iTransformer on Solar / PEMS, where the
+        official code passes x_mark_enc = None)."""
+        bb = self.args.backbone
+        if bb in GTR_FAMILY:
+            return 'cycle'
+        if bb in PLAIN_BACKBONES:
+            d = str(self.args.data)
+            return 'none' if (d == 'Solar' or 'PEMS' in d) else 'marks'
+        raise ValueError(f'unsupported backbone {bb}')
+
     def get_data(self, flag):
         if flag not in self._data:
-            self._data[flag] = self._get_data(flag)
+            ds, loader = self._get_data(flag)
+            if self.cond_mode == 'marks':
+                _marks_as_condition(ds)
+            self._data[flag] = (ds, loader)
         return self._data[flag]
+
+    def radar_batch_size(self):
+        """Batch size of the RADAR stages (S2 / S3 training and their validation); 0 = the backbone's batch size."""
+        return int(getattr(self.args, 'radar_batch_size', 0) or 0) or int(self.args.batch_size)
+
+    def radar_train_loader(self):
+        """Shuffled training loader of the RADAR stages; identical to get_data('train') unless --radar_batch_size."""
+        ds, loader = self.get_data('train')
+        bs = self.radar_batch_size()
+        if bs == int(self.args.batch_size):
+            return ds, loader
+        if 'train_radar' not in self._data:
+            self._data['train_radar'] = (ds, DataLoader(ds, batch_size=bs, shuffle=True,
+                                                         num_workers=self.args.num_workers, drop_last=True))
+        return self._data['train_radar']
+
+    def single_condition(self, bc):
+        """The backbone's extra argument for ONE dataset item (batch of 1)."""
+        m = self.cond_mode
+        if m == 'cycle':
+            return torch.as_tensor(bc).view(1).int().to(self.device)
+        if m == 'marks':
+            return torch.as_tensor(np.asarray(bc)).float().unsqueeze(0).to(self.device)
+        return None
 
     def ordered_loader(self, flag):
         """Unshuffled, no drop_last loader (deterministic fixed-seed perturbations for S1-S3 validation)."""
         key = flag + '_ordered'
         if key not in self._data:
             ds, _ = self.get_data(flag)
-            self._data[key] = (ds, DataLoader(ds, batch_size=self.args.batch_size, shuffle=False,
+            self._data[key] = (ds, DataLoader(ds, batch_size=self.radar_batch_size(), shuffle=False,
                                               num_workers=self.args.num_workers, drop_last=False))
         return self._data[key]
 
@@ -217,12 +280,16 @@ class Exp_Radar(Exp_Main):
         return raw_zero_from_scaler(train_ds.scaler, mode or self.args.zero_mode)
 
     def _to_dev(self, bx, by, bc):
-        return bx.float().to(self.device), by.float().to(self.device), bc.int().to(self.device)
+        m = self.cond_mode
+        c = bc.int().to(self.device) if m == 'cycle' else (bc.float().to(self.device) if m == 'marks' else None)
+        return bx.float().to(self.device), by.float().to(self.device), c
 
     def _forward(self, model, x, cycle, **kw):
-        if any(s in self.args.model for s in ('CycleNet', 'GTR')):
+        """GTR family: model(x, cycle_index); iTransformer: model(x, x_mark_enc or None) (positional, like the
+        official model(batch_x, batch_x_mark, dec_inp, batch_y_mark): the decoder inputs are unused by it)."""
+        if any(s in self.args.model for s in ('CycleNet', 'GTR')) or self.args.backbone in PLAIN_BACKBONES:
             return model(x, cycle, **kw)
-        raise ValueError(f'Exp_Radar only supports GTR-family backbones, got {self.args.model}')
+        raise ValueError(f'Exp_Radar supports GTR-family backbones and {PLAIN_BACKBONES}, got {self.args.model}')
 
     def _train_mode(self, freeze_backbone=False, freeze_stage_a=False):
         self.model.train()
@@ -300,11 +367,14 @@ class Exp_Radar(Exp_Main):
 
         model = self.model
         model_optim = optim.Adam(model.parameters(), lr=args.learning_rate)
-        # The original loop always constructs OneCycleLR. Even with lradj=type3 its constructor sets the epoch-1 lr
-        # to learning_rate/25 and Adam beta1 to 0.95; we keep it so S0 reproduces run.py.
-        scheduler = lr_scheduler.OneCycleLR(optimizer=model_optim, steps_per_epoch=len(train_loader),
-                                            pct_start=args.pct_start, epochs=args.train_epochs,
-                                            max_lr=args.learning_rate)
+        # The original GTR loop always constructs OneCycleLR. Even with lradj=type3 its constructor sets the epoch-1
+        # lr to learning_rate/25 and Adam beta1 to 0.95; we keep it so S0 reproduces run.py. Plain backbones
+        # (iTransformer) follow their official loop instead: plain Adam + adjust_learning_rate (lradj, e.g. type1).
+        scheduler = None
+        if self.cond_mode == 'cycle':
+            scheduler = lr_scheduler.OneCycleLR(optimizer=model_optim, steps_per_epoch=len(train_loader),
+                                                pct_start=args.pct_start, epochs=args.train_epochs,
+                                                max_lr=args.learning_rate)
         criterion = nn.MSELoss()
         stopper = EarlyStopper(args.patience, ckpt_path)
 
@@ -452,12 +522,13 @@ class Exp_Radar(Exp_Main):
             p.requires_grad_(False)
         if getattr(W, 'label_free', False):
             return self._pretrain_label_free(out_ckpt)
-        _, train_loader = self.get_data('train')
+        _, train_loader = self.radar_train_loader()
         rz = self.raw_zero()
         perturber = self.mixture(rz, args.random_seed + 202)
         val_pert = self.mixture(rz, args.val_seed)
         opt = optim.Adam(W.stage_a_parameters(), lr=args.radar_lr)  # stage A: ReliabilityNet + Repairer
-        best = float('inf')
+        best, bad = float('inf'), 0
+        pre_patience = int(getattr(args, 'pre_patience', 0))  # 0 = always run pre_epochs (default)
         for epoch in range(args.pre_epochs):
             self._train_mode(freeze_backbone=True)
             t0, parts = time.time(), []
@@ -483,9 +554,14 @@ class Exp_Radar(Exp_Main):
             print(f'[S2] epoch {epoch + 1} ({time.time() - t0:.1f}s) train det {pd_:.4f} rec {pr_:.4f} | '
                   f'val det+rec {v:.4f}')
             if v < best:
-                best = v
+                best, bad = v, 0
                 torch.save(W.state_dict(), out_ckpt)
                 print(f'[S2] saved {out_ckpt}')
+            else:
+                bad += 1
+                if pre_patience > 0 and bad >= pre_patience:
+                    print(f'[S2] early stopping: no val improvement for {bad} epochs')
+                    break
         W.load_state_dict(torch.load(out_ckpt, map_location=self.device))
         for p in W.backbone.parameters():
             p.requires_grad_(True)
@@ -549,7 +625,7 @@ class Exp_Radar(Exp_Main):
 
     def _train_label_free(self, W, out_ckpt):
         args = self.args
-        _, train_loader = self.get_data('train')
+        _, train_loader = self.radar_train_loader()
         _, val_loader = self.ordered_loader('val')
         params = list(W.repairer.parameters()) + list(W.router.parameters())
         opt = optim.Adam(params, lr=args.radar_lr)
@@ -639,12 +715,13 @@ class Exp_Radar(Exp_Main):
     def _pretrain_label_free(self, out_ckpt):
         args = self.args
         W = self.model
-        _, train_loader = self.get_data('train')
+        _, train_loader = self.radar_train_loader()
         params = list(W.repairer.parameters()) + list(W.router.parameters())
         opt = optim.Adam(params, lr=args.radar_lr)
         lam_route = float(getattr(args, 'lam_route', 0.5))
         _, val_loader = self.ordered_loader('val')
-        best = float('inf')
+        best, bad = float('inf'), 0
+        pre_patience = int(getattr(args, 'pre_patience', 0))  # 0 = always run pre_epochs (default)
         for epoch in range(args.pre_epochs):
             self._train_mode(freeze_backbone=True)
             t0, parts = time.time(), []
@@ -671,9 +748,14 @@ class Exp_Radar(Exp_Main):
             print(f'[S2-lf] epoch {epoch + 1} ({time.time() - t0:.1f}s) train rec {pr_:.4f} route {pq_:.5f} | '
                   f'val rec+route {v:.4f}')
             if v < best:
-                best = v
+                best, bad = v, 0
                 torch.save(W.state_dict(), out_ckpt)
                 print(f'[S2-lf] saved {out_ckpt}')
+            else:
+                bad += 1
+                if pre_patience > 0 and bad >= pre_patience:
+                    print(f'[S2-lf] early stopping: no val improvement for {bad} epochs')
+                    break
         W.load_state_dict(torch.load(out_ckpt, map_location=self.device))
         for p in W.backbone.parameters():
             p.requires_grad_(True)
@@ -694,7 +776,7 @@ class Exp_Radar(Exp_Main):
             # no corruption anywhere: (1) masked-forecast training of E1 + Router on clean windows (optional),
             # (2) calibration of the anchor threshold, τ and δ on clean training windows, (3) τ chosen on the clean
             # validation windows as the most repairing value whose clean forecast cost stays within lf_clean_budget
-            _, train_loader = self.get_data('train')
+            _, train_loader = self.radar_train_loader()
             if int(getattr(args, 'lf_train', 1)):
                 self._train_label_free(W, out_ckpt)
             else:
@@ -723,7 +805,7 @@ class Exp_Radar(Exp_Main):
             groups.append({'params': list(W.backbone.parameters()), 'lr': bb_lr, 'lr0': bb_lr})
         opt = optim.Adam(groups)
 
-        _, train_loader = self.get_data('train')
+        _, train_loader = self.radar_train_loader()
         rz = self.raw_zero()
         perturber = self.mixture(rz, args.random_seed + 101)  # same stream as S1
         val_pert = self.mixture(rz, args.val_seed)

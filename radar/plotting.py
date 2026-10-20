@@ -114,7 +114,7 @@ def plot_examples(exp, fig_dir, n_examples=3, conditions=('zero_tail_k4_c100', '
             bx, by, _, _, bc = test_ds[idx]
             x = torch.as_tensor(np.asarray(bx)).float().unsqueeze(0).to(exp.device)
             y = torch.as_tensor(np.asarray(by)).float().unsqueeze(0).to(exp.device)
-            c = torch.as_tensor(bc).view(1).int().to(exp.device)
+            c = exp.single_condition(bc)
             x_p, _ = apply_condition(x, cond, rz, args.zero_mode, condition_rng(args.grid_seed, cond, 10_000 + idx),
                                      guard=args.radar_patch)
             preds = {}

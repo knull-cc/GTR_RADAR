@@ -22,7 +22,8 @@
 #   REPRO_STRICT=1   stop if |S0 - run.py| / run.py >= 2%  (default 1)
 #   BACKBONE=GTR     GTR | GTRiTransformer | GTRPatchTST | GTRDLinear
 #   EXTRA_ARGS="..." extra run.py-compatible args for every call (e.g. "--num_workers 4")
-#   RADAR_ARGS="..." extra RADAR-only args (e.g. "--test_grid main", "--router h", "--experts e1,e2")
+#   RADAR_ARGS="..." extra RADAR-only args (e.g. "--test_grid main", "--router h", "--experts e1,e2",
+#                    "--pre_patience 5" = early stopping of S2 after 5 epochs without val improvement; default off)
 #   ABLATION=1       also train/evaluate Ours (joint training, backbone fine-tuned) as an ablation
 #   ARGMAX=1         also evaluate the plug-in with hard (argmax) routing (Ours-argmax)
 #   ORACLE=1         also evaluate the plug-in with a perfect gate (Ours-oracle, upper bound of the gate)
@@ -70,8 +71,11 @@ check_data() {
 }
 
 # sets: mid setting data_args common log
+# A dataset script may define set_backbone_args <pred_len> to set GTR_ARGS per horizon (official per-H
+# hyper-parameters, e.g. scripts/RADAR_iTransformer/).
 _setup() {
   local pred_len=$1 seed=$2 skip=$3
+  if declare -F set_backbone_args >/dev/null; then set_backbone_args "$pred_len"; fi
   mid=${model_id_name}_${seq_len}_${pred_len}
   setting=${mid}_${BACKBONE}_${data_name}_ftM_sl${seq_len}_pl${pred_len}_cycle${cycle}_seed${seed}
   data_args=(--root_path "$root_path_name" --data_path "$data_path_name" --model_id "$mid" --data "$data_name"
@@ -167,6 +171,7 @@ run_all() {
   $PY -u run_radar.py summarize --results_dir "$RESULTS_DIR" 2>&1 | tee "$LOG_DIR/summary_${model_id_name}.log"
   local p0 s0
   p0=$(echo $PRED_LENS | awk '{print $1}'); s0=$(echo $SEEDS | awk '{print $1}')
+  if declare -F set_backbone_args >/dev/null; then set_backbone_args "$p0"; fi
   # shellcheck disable=SC2086
   $PY -u run_radar.py plot --root_path "$root_path_name" --data_path "$data_path_name" \
     --model_id "${model_id_name}_${seq_len}_${p0}" --data "$data_name" --pred_len "$p0" --random_seed "$s0" \
